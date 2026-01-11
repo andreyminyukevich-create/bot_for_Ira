@@ -2,8 +2,8 @@ import os
 import re
 import random
 import logging
-import asyncio
-from typing import Optional, Dict, Any, List, Tuple
+import hashlib
+from typing import Optional, Dict, Any, List
 
 import aiohttp
 from telegram import (
@@ -41,12 +41,21 @@ WIFE_TG_ID = int(os.getenv("WIFE_TG_ID", "0").strip() or 0)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # например: https://xxxxx.up.railway.app
 PORT = int(os.getenv("PORT", "8080"))
 
+# Необязательный путь для webhook. Если не задан — сделаем безопасный хэш токена.
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 if not SCRIPT_URL:
     raise RuntimeError("SCRIPT_URL is missing")
 if not WIFE_TG_ID:
     raise RuntimeError("WIFE_TG_ID is missing")
+
+
+def _default_webhook_path() -> str:
+    # чтобы не светить токен в url_path и логах
+    h = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()
+    return f"tg/{h[:24]}"
 
 
 # =========================
@@ -94,7 +103,8 @@ EXPENSES: Dict[str, List[str]] = {
         "Телефон", "Телевидение", "Интернет", "Электричество",
         "Отопление/газ", "Вода", "Вывоз мусора", "Другое"
     ],
-    "Красота": ["Маникюр", "Педикюр", "Парикмахер", "Убирание волос", "Ресницы", "Массаж"],
+    # Красота — как договорились: массаж + другое (и без “ресницы”, чтобы было аккуратно)
+    "Красота": ["Маникюр", "Педикюр", "Парикмахер", "Убирание волос", "Массаж", "Другое"],
 }
 
 INCOME_CATEGORIES = [
@@ -111,7 +121,7 @@ PH_EXP_CAT = [
     "Что оплатили? Давай выберем категорию.",
     "Окей, рассказывай — что за трата?",
     "Давай зафиксируем: какая категория?",
-    "Выбирай, на что это было",
+    "Выбирай, на что это было 🙂",
     "На что записываем расход?",
     "Что купила? 🙂",
     "Куда улетели денежки? 🙂",
@@ -300,8 +310,7 @@ def kb_income_categories() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def kb_skip_comment(back_cb: str = "") -> InlineKeyboardMarkup:
-    # back_cb оставляем на будущее, но сейчас не используем
+def kb_skip_comment() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Пропустить", callback_data="comment:skip")],
     ])
@@ -325,21 +334,19 @@ def kb_analysis_period() -> InlineKeyboardMarkup:
 
 
 # =========================
-# Amount parsing (как ты любишь: 2500, 2 500, 2.500, 2500,50, 2к)
+# Amount parsing (2500, 2 500, 2.500, 2500,50, 2к)
 # =========================
 def parse_amount(text: str) -> Optional[float]:
     if not text:
         return None
     s0 = text.strip().lower()
 
-    # быстрые кейсы типа "2к", "2k"
     mult = 1.0
     s = re.sub(r"\s+", "", s0)
     if s.endswith("к") or s.endswith("k"):
         mult = 1000.0
         s = s[:-1]
 
-    # если есть и , и . — считаем последний из них разделителем дроби, остальные — тысячные
     has_comma = "," in s
     has_dot = "." in s
 
@@ -353,7 +360,6 @@ def parse_amount(text: str) -> Optional[float]:
     elif has_comma and not has_dot:
         s = s.replace(",", ".")
     else:
-        # только точка или ничего — ок
         pass
 
     s = re.sub(r"[^0-9.\-]", "", s)
@@ -370,7 +376,6 @@ def parse_amount(text: str) -> Optional[float]:
 # GAS API
 # =========================
 async def gas_request(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # всегда шлём user_id
     payload = dict(payload)
     payload["user_id"] = WIFE_TG_ID
 
@@ -463,7 +468,6 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    # очистим черновик транзакции
     context.user_data.pop("tx", None)
     context.user_data["tx"] = {}
 
@@ -548,12 +552,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx["amount"] = amt
     context.user_data["tx"] = tx
 
-    # вопрос про коммент + кнопка пропустить
-    if tx.get("type") == "расход":
-        text = random.choice(PH_COMMENT_EXP)
-    else:
-        text = random.choice(PH_COMMENT_INC)
-
+    text = random.choice(PH_COMMENT_EXP) if tx.get("type") == "расход" else random.choice(PH_COMMENT_INC)
     await update.message.reply_text(text, reply_markup=kb_skip_comment())
     return ST_COMMENT
 
@@ -579,8 +578,6 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx["comment"] = (update.message.text or "").strip()
     context.user_data["tx"] = tx
 
-    # сохраняем и показываем главный экран
-    # здесь нет callback_query, поэтому отправим отдельным сообщением
     await save_and_show_message_(update, context)
     return ST_MENU
 
@@ -598,7 +595,6 @@ async def save_and_show_(q, context: ContextTypes.DEFAULT_TYPE):
 
     await gas_request(payload)
 
-    # подтверждение
     if tx.get("type") == "расход":
         header = random.choice(PH_SAVED_EXP)
         detail = f"{tx.get('category')} → {tx.get('subcategory')} — {tx.get('amount'):,.2f} ₽".replace(",", " ")
@@ -758,33 +754,28 @@ def build_app() -> Application:
     return app
 
 
-async def main():
+def run():
     app = build_app()
 
-    # Webhook если WEBHOOK_URL задан (Railway удобно)
     if WEBHOOK_URL:
-        # Чтобы два бота/окружения не путались, используем token как path
-        url_path = BOT_TOKEN
+        url_path = WEBHOOK_PATH or _default_webhook_path()
         full_webhook = f"{WEBHOOK_URL.rstrip('/')}/{url_path}"
 
-        logger.info("Starting webhook on 0.0.0.0:%s | webhook=%s", PORT, full_webhook)
-        await app.bot.set_webhook(url=full_webhook)
+        # Не логируем полный URL, чтобы ничего не утекало
+        logger.info("Starting webhook on 0.0.0.0:%s", PORT)
 
-        await app.run_webhook(
+        # В PTB это синхронный “вечный” запуск (сам ставит webhook)
+        app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=url_path,
             webhook_url=full_webhook,
             allowed_updates=Update.ALL_TYPES,
-            close_loop=False,
         )
     else:
         logger.info("Starting polling")
-        await app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    run()
