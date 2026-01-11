@@ -103,7 +103,7 @@ EXPENSES: Dict[str, List[str]] = {
         "Телефон", "Телевидение", "Интернет", "Электричество",
         "Отопление/газ", "Вода", "Вывоз мусора", "Другое"
     ],
-    # Красота — как договорились: массаж + другое (и без “ресницы”, чтобы было аккуратно)
+    # Красота — как договорились: массаж + другое (и без "ресницы", чтобы было аккуратно)
     "Красота": ["Маникюр", "Педикюр", "Парикмахер", "Убирание волос", "Массаж", "Другое"],
 }
 
@@ -240,7 +240,8 @@ DENY_TEXT = "Извини, доступ только для Иришки 🙂"
     ST_INC_CATEGORY,
     ST_ANALYSIS_KIND,
     ST_ANALYSIS_PERIOD,
-) = range(9)
+    ST_SET_BALANCE,
+) = range(10)
 
 
 # =========================
@@ -255,6 +256,7 @@ def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Внести транзакцию", callback_data="menu:add")],
         [InlineKeyboardButton("📊 Анализ", callback_data="menu:analysis")],
+        [InlineKeyboardButton("💰 Установить баланс", callback_data="menu:set_balance")],
     ])
 
 
@@ -365,7 +367,7 @@ def parse_amount(text: str) -> Optional[float]:
     s = re.sub(r"[^0-9.\-]", "", s)
     try:
         val = float(s) * mult
-        if val <= 0:
+        if val < 0:
             return None
         return round(val, 2)
     except Exception:
@@ -399,11 +401,16 @@ async def month_screen_text() -> str:
     exp = s.get("expenses", 0)
     inc = s.get("incomes", 0)
     bal = s.get("balance", 0)
+    init_bal = s.get("initial_balance", 0)
+    curr_bal = s.get("current_balance", 0)
+    
     return (
         f"<b>{month}</b>\n"
+        f"💰 Начальный баланс: <b>{init_bal:,.2f}</b> ₽\n"
         f"➖ Расходы: <b>{exp:,.2f}</b> ₽\n"
         f"➕ Доходы: <b>{inc:,.2f}</b> ₽\n"
-        f"🟰 Баланс: <b>{bal:,.2f}</b> ₽"
+        f"🟰 За месяц: <b>{bal:,.2f}</b> ₽\n"
+        f"💵 Текущий баланс: <b>{curr_bal:,.2f}</b> ₽"
     ).replace(",", " ")
 
 
@@ -436,6 +443,14 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "menu:analysis":
         await q.edit_message_text("Что посмотрим?", reply_markup=kb_analysis_kind())
         return ST_ANALYSIS_KIND
+
+    if q.data == "menu:set_balance":
+        await q.edit_message_text(
+            "Какой у тебя сейчас баланс? 💰\n\n"
+            "Напиши сумму (например: 50000 или 50к)",
+            parse_mode=ParseMode.HTML
+        )
+        return ST_SET_BALANCE
 
     return ST_MENU
 
@@ -683,6 +698,29 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ST_MENU
 
 
+async def set_balance_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return ConversationHandler.END
+
+    amt = parse_amount(update.message.text)
+    if amt is None or amt < 0:
+        await update.message.reply_text(
+            "Не понял сумму 🙈\nНапиши, пожалуйста, например: 50000 / 50 000 / 50к"
+        )
+        return ST_SET_BALANCE
+
+    await gas_request({"cmd": "set_balance", "amount": amt})
+
+    txt = await month_screen_text()
+    await update.message.reply_text(
+        f"Отлично! ✅ Начальный баланс установлен: <b>{amt:,.2f}</b> ₽\n\n{txt}".replace(",", " "),
+        reply_markup=kb_main(),
+        parse_mode=ParseMode.HTML
+    )
+    return ST_MENU
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -690,7 +728,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Кнопки внизу 🙂\n"
         "• Внести транзакцию\n"
-        "• Анализ"
+        "• Анализ\n"
+        "• Установить баланс"
     )
 
 
@@ -743,6 +782,9 @@ def build_app() -> Application:
                 CallbackQueryHandler(analysis_period, pattern=r"^aperiod:"),
                 CallbackQueryHandler(back_router, pattern=r"^back:"),
             ],
+            ST_SET_BALANCE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_balance_received),
+            ],
         },
         fallbacks=[CommandHandler("help", cmd_help)],
         allow_reentry=True,
@@ -764,7 +806,7 @@ def run():
         # Не логируем полный URL, чтобы ничего не утекало
         logger.info("Starting webhook on 0.0.0.0:%s", PORT)
 
-        # В PTB это синхронный “вечный” запуск (сам ставит webhook)
+        # В PTB это синхронный "вечный" запуск (сам ставит webhook)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
