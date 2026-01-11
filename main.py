@@ -38,10 +38,8 @@ SCRIPT_URL = os.getenv("SCRIPT_URL", "").strip()
 WIFE_TG_ID = int(os.getenv("WIFE_TG_ID", "0").strip() or 0)
 
 # Для webhook (Railway)
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # например: https://xxxxx.up.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
-
-# Необязательный путь для webhook. Если не задан — сделаем безопасный хэш токена.
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()
 
 if not BOT_TOKEN:
@@ -53,7 +51,6 @@ if not WIFE_TG_ID:
 
 
 def _default_webhook_path() -> str:
-    # чтобы не светить токен в url_path и логах
     h = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()
     return f"tg/{h[:24]}"
 
@@ -103,7 +100,6 @@ EXPENSES: Dict[str, List[str]] = {
         "Телефон", "Телевидение", "Интернет", "Электричество",
         "Отопление/газ", "Вода", "Вывоз мусора", "Другое"
     ],
-    # Красота — как договорились: массаж + другое (и без "ресницы", чтобы было аккуратно)
     "Красота": ["Маникюр", "Педикюр", "Парикмахер", "Убирание волос", "Массаж", "Другое"],
 }
 
@@ -113,7 +109,7 @@ INCOME_CATEGORIES = [
 
 
 # =========================
-# Phrases (мягко, заботливо)
+# Phrases
 # =========================
 PH_EXP_CAT = [
     "На что потратилась, Иришка? 🙂",
@@ -245,7 +241,29 @@ DENY_TEXT = "Извини, доступ только для Иришки 🙂"
 
 
 # =========================
-# Helpers: access + keyboards
+# Helpers: temp messages
+# =========================
+async def delete_temp_messages(context: ContextTypes.DEFAULT_TYPE, update: Update):
+    """Удалить все временные сообщения"""
+    temp = context.user_data.get("temp_messages", [])
+    for msg_id in temp:
+        try:
+            await update.effective_chat.send_chat_action("typing")  # dummy для context
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+        except Exception:
+            pass
+    context.user_data["temp_messages"] = []
+
+
+def add_temp_message(context: ContextTypes.DEFAULT_TYPE, message_id: int):
+    """Добавить message_id в список временных"""
+    if "temp_messages" not in context.user_data:
+        context.user_data["temp_messages"] = []
+    context.user_data["temp_messages"].append(message_id)
+
+
+# =========================
+# Helpers: keyboards
 # =========================
 def is_allowed(update: Update) -> bool:
     user = update.effective_user
@@ -336,7 +354,7 @@ def kb_analysis_period() -> InlineKeyboardMarkup:
 
 
 # =========================
-# Amount parsing (2500, 2 500, 2.500, 2500,50, 2к)
+# Amount parsing
 # =========================
 def parse_amount(text: str) -> Optional[float]:
     if not text:
@@ -422,8 +440,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
 
+    # Очистить все временные сообщения при старте
+    context.user_data["temp_messages"] = []
+
     txt = await month_screen_text()
-    await update.message.reply_text(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+    msg = await update.message.reply_text(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+    
+    # Главный экран НЕ временный — не добавляем в temp
+    # Сохраним его ID отдельно для обновления
+    context.user_data["main_screen_id"] = msg.message_id
+    
     return ST_MENU
 
 
@@ -437,19 +463,23 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if q.data == "menu:add":
-        await q.edit_message_text("Окей 🙂 Что вносим?", reply_markup=kb_choose_type())
+        # Edit главного экрана на промежуточное сообщение
+        msg = await q.edit_message_text("Окей 🙂 Что вносим?", reply_markup=kb_choose_type())
+        add_temp_message(context, msg.message_id)
         return ST_ADD_CHOOSE_TYPE
 
     if q.data == "menu:analysis":
-        await q.edit_message_text("Что посмотрим?", reply_markup=kb_analysis_kind())
+        msg = await q.edit_message_text("Что посмотрим?", reply_markup=kb_analysis_kind())
+        add_temp_message(context, msg.message_id)
         return ST_ANALYSIS_KIND
 
     if q.data == "menu:set_balance":
-        await q.edit_message_text(
+        msg = await q.edit_message_text(
             "Какой у тебя сейчас баланс? 💰\n\n"
             "Напиши сумму (например: 50000 или 50к)",
             parse_mode=ParseMode.HTML
         )
+        add_temp_message(context, msg.message_id)
         return ST_SET_BALANCE
 
     return ST_MENU
@@ -460,8 +490,20 @@ async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if q.data == "back:menu":
+        # Удаляем все промежуточные
+        await delete_temp_messages(context, update)
+        
+        # Показываем главный экран
         txt = await month_screen_text()
-        await q.edit_message_text(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+        msg = await q.message.reply_text(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+        context.user_data["main_screen_id"] = msg.message_id
+        
+        # Удаляем старое сообщение с кнопкой "Назад"
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        
         return ST_MENU
 
     if q.data == "back:choose_type":
@@ -556,19 +598,33 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
 
+    # Удаляем сообщение пользователя
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     amt = parse_amount(update.message.text)
     if amt is None:
-        await update.message.reply_text(
+        # Удаляем предыдущие temp
+        await delete_temp_messages(context, update)
+        
+        msg = await update.effective_chat.send_message(
             "Не понял сумму 🙈\nНапиши, пожалуйста, например: 2500 / 2 500 / 2500,50 / 2к"
         )
+        add_temp_message(context, msg.message_id)
         return ST_AMOUNT
 
     tx = context.user_data.get("tx", {})
     tx["amount"] = amt
     context.user_data["tx"] = tx
 
+    # Удаляем предыдущие temp
+    await delete_temp_messages(context, update)
+
     text = random.choice(PH_COMMENT_EXP) if tx.get("type") == "расход" else random.choice(PH_COMMENT_INC)
-    await update.message.reply_text(text, reply_markup=kb_skip_comment())
+    msg = await update.effective_chat.send_message(text, reply_markup=kb_skip_comment())
+    add_temp_message(context, msg.message_id)
     return ST_COMMENT
 
 
@@ -580,7 +636,16 @@ async def comment_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx["comment"] = ""
     context.user_data["tx"] = tx
 
-    await save_and_show_(q, context)
+    # Удаляем все промежуточные
+    await delete_temp_messages(context, update)
+    
+    # Удаляем сообщение с кнопкой "Пропустить"
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
+    await save_and_finish_(update, context)
     return ST_MENU
 
 
@@ -589,15 +654,25 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
 
+    # Удаляем сообщение пользователя
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     tx = context.user_data.get("tx", {})
     tx["comment"] = (update.message.text or "").strip()
     context.user_data["tx"] = tx
 
-    await save_and_show_message_(update, context)
+    # Удаляем все промежуточные
+    await delete_temp_messages(context, update)
+
+    await save_and_finish_(update, context)
     return ST_MENU
 
 
-async def save_and_show_(q, context: ContextTypes.DEFAULT_TYPE):
+async def save_and_finish_(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранить транзакцию и показать финальное подтверждение + главный экран"""
     tx = context.user_data.get("tx", {})
     payload = {
         "cmd": "add",
@@ -621,44 +696,17 @@ async def save_and_show_(q, context: ContextTypes.DEFAULT_TYPE):
     if comment:
         detail += f"\nКоммент: {comment}"
 
+    # Отправляем финальное подтверждение (НЕ temp — оставляем в истории)
+    await update.effective_chat.send_message(f"{header}\n{detail}")
+
+    # Отправляем главный экран
     txt_month = await month_screen_text()
-    await q.edit_message_text(
-        f"{header}\n{detail}\n\n{txt_month}",
+    msg = await update.effective_chat.send_message(
+        txt_month,
         reply_markup=kb_main(),
         parse_mode=ParseMode.HTML
     )
-
-
-async def save_and_show_message_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tx = context.user_data.get("tx", {})
-    payload = {
-        "cmd": "add",
-        "type": tx.get("type"),
-        "category": tx.get("category"),
-        "subcategory": tx.get("subcategory", ""),
-        "amount": tx.get("amount"),
-        "comment": tx.get("comment", ""),
-    }
-
-    await gas_request(payload)
-
-    if tx.get("type") == "расход":
-        header = random.choice(PH_SAVED_EXP)
-        detail = f"{tx.get('category')} → {tx.get('subcategory')} — {tx.get('amount'):,.2f} ₽".replace(",", " ")
-    else:
-        header = random.choice(PH_SAVED_INC)
-        detail = f"{tx.get('category')} — {tx.get('amount'):,.2f} ₽".replace(",", " ")
-
-    comment = tx.get("comment", "").strip()
-    if comment:
-        detail += f"\nКоммент: {comment}"
-
-    txt_month = await month_screen_text()
-    await update.message.reply_text(
-        f"{header}\n{detail}\n\n{txt_month}",
-        reply_markup=kb_main(),
-        parse_mode=ParseMode.HTML
-    )
+    context.user_data["main_screen_id"] = msg.message_id
 
 
 async def analysis_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -682,7 +730,7 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    period = q.data.split(":")[1]  # today/month/year
+    period = q.data.split(":")[1]
     kind = context.user_data.get("analysis_kind", "расход")
 
     res = await gas_request({"cmd": "analysis", "kind": kind, "period": period})
@@ -694,7 +742,23 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"<b>{kind_label}</b> — <b>{label_map.get(period, period)}</b>\nСумма: <b>{total:,.2f}</b> ₽"
     text = text.replace(",", " ")
 
-    await q.edit_message_text(text, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+    # Удаляем промежуточные
+    await delete_temp_messages(context, update)
+    
+    # Показываем результат (НЕ temp)
+    await q.message.reply_text(text, parse_mode=ParseMode.HTML)
+    
+    # Удаляем сообщение с кнопками периода
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    
+    # Показываем главный экран
+    txt = await month_screen_text()
+    msg = await update.effective_chat.send_message(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+    context.user_data["main_screen_id"] = msg.message_id
+    
     return ST_MENU
 
 
@@ -703,21 +767,39 @@ async def set_balance_received(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
 
+    # Удаляем сообщение пользователя
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     amt = parse_amount(update.message.text)
     if amt is None or amt < 0:
-        await update.message.reply_text(
+        # Удаляем предыдущие temp
+        await delete_temp_messages(context, update)
+        
+        msg = await update.effective_chat.send_message(
             "Не понял сумму 🙈\nНапиши, пожалуйста, например: 50000 / 50 000 / 50к"
         )
+        add_temp_message(context, msg.message_id)
         return ST_SET_BALANCE
 
     await gas_request({"cmd": "set_balance", "amount": amt})
 
-    txt = await month_screen_text()
-    await update.message.reply_text(
-        f"Отлично! ✅ Начальный баланс установлен: <b>{amt:,.2f}</b> ₽\n\n{txt}".replace(",", " "),
-        reply_markup=kb_main(),
+    # Удаляем все промежуточные
+    await delete_temp_messages(context, update)
+
+    # Отправляем подтверждение (НЕ temp)
+    await update.effective_chat.send_message(
+        f"Отлично! ✅ Начальный баланс установлен: <b>{amt:,.2f}</b> ₽".replace(",", " "),
         parse_mode=ParseMode.HTML
     )
+    
+    # Показываем главный экран
+    txt = await month_screen_text()
+    msg = await update.effective_chat.send_message(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+    context.user_data["main_screen_id"] = msg.message_id
+    
     return ST_MENU
 
 
@@ -803,10 +885,8 @@ def run():
         url_path = WEBHOOK_PATH or _default_webhook_path()
         full_webhook = f"{WEBHOOK_URL.rstrip('/')}/{url_path}"
 
-        # Не логируем полный URL, чтобы ничего не утекало
         logger.info("Starting webhook on 0.0.0.0:%s", PORT)
 
-        # В PTB это синхронный "вечный" запуск (сам ставит webhook)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
