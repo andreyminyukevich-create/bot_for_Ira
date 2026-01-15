@@ -237,7 +237,10 @@ DENY_TEXT = "Извини, доступ только для Иришки 🙂"
     ST_ANALYSIS_KIND,
     ST_ANALYSIS_PERIOD,
     ST_SET_BALANCE,
-) = range(10)
+    ST_EDIT_SELECT,
+    ST_EDIT_FIELD,
+    ST_EDIT_VALUE,
+) = range(13)
 
 
 # =========================
@@ -265,6 +268,7 @@ def is_allowed(update: Update) -> bool:
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Внести транзакцию", callback_data="menu:add")],
+        [InlineKeyboardButton("📝 Скорректировать записи", callback_data="menu:edit")],
         [InlineKeyboardButton("📊 Анализ", callback_data="menu:analysis")],
         [InlineKeyboardButton("💰 Установить баланс", callback_data="menu:set_balance")],
     ])
@@ -342,6 +346,32 @@ def kb_analysis_period() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("В этом месяце", callback_data="aperiod:month")],
         [InlineKeyboardButton("В этом году", callback_data="aperiod:year")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back:analysis_kind")],
+    ])
+
+
+def kb_edit_list(transactions: List[Dict]) -> InlineKeyboardMarkup:
+    """Клавиатура со списком последних записей"""
+    rows = []
+    for tx in transactions:
+        row_id = tx["row_id"]
+        date_str = tx["date"][:10]  # YYYY-MM-DD
+        tx_type = tx["type"]
+        emoji = "➖" if tx_type == "расход" else "➕"
+        cat = tx["category"]
+        amt = tx["amount"]
+        label = f"{emoji} {date_str} | {cat} | {amt:,.0f} ₽".replace(",", " ")
+        rows.append([InlineKeyboardButton(label, callback_data=f"edit_row:{row_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_edit_field() -> InlineKeyboardMarkup:
+    """Клавиатура для выбора что редактировать"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Изменить сумму", callback_data="edit_field:amount")],
+        [InlineKeyboardButton("💬 Изменить комментарий", callback_data="edit_field:comment")],
+        [InlineKeyboardButton("🗑 Удалить запись", callback_data="edit_field:delete")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back:edit_list")],
     ])
 
 
@@ -454,6 +484,24 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["working_message_id"] = q.message.message_id
         return ST_ADD_CHOOSE_TYPE
 
+    if q.data == "menu:edit":
+        # Получаем последние 5 записей
+        result = await gas_request({"cmd": "get_recent_transactions", "limit": 5})
+        transactions = result.get("transactions", [])
+        
+        if not transactions:
+            await q.answer("Нет записей для редактирования", show_alert=True)
+            return ST_MENU
+        
+        await q.edit_message_text(
+            "<b>📝 Выбери запись для редактирования:</b>",
+            reply_markup=kb_edit_list(transactions),
+            parse_mode=ParseMode.HTML
+        )
+        context.user_data["working_message_id"] = q.message.message_id
+        context.user_data["edit_transactions"] = transactions
+        return ST_EDIT_SELECT
+
     if q.data == "menu:analysis":
         await q.edit_message_text("Что посмотрим?", reply_markup=kb_analysis_kind())
         context.user_data["working_message_id"] = q.message.message_id
@@ -496,6 +544,16 @@ async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "back:analysis_kind":
         await q.edit_message_text("Что посмотрим?", reply_markup=kb_analysis_kind())
         return ST_ANALYSIS_KIND
+
+    if q.data == "back:edit_list":
+        # Возврат к списку записей
+        transactions = context.user_data.get("edit_transactions", [])
+        await q.edit_message_text(
+            "<b>📝 Выбери запись для редактирования:</b>",
+            reply_markup=kb_edit_list(transactions),
+            parse_mode=ParseMode.HTML
+        )
+        return ST_EDIT_SELECT
 
     return ST_MENU
 
@@ -774,6 +832,151 @@ async def set_balance_received(update: Update, context: ContextTypes.DEFAULT_TYP
     return ST_MENU
 
 
+# =========================
+# EDIT HANDLERS
+# =========================
+async def edit_select_row(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь выбрал запись для редактирования"""
+    q = update.callback_query
+    await q.answer()
+
+    row_id = int(q.data.split(":")[1])
+    
+    # Находим транзакцию
+    transactions = context.user_data.get("edit_transactions", [])
+    selected_tx = None
+    for tx in transactions:
+        if tx["row_id"] == row_id:
+            selected_tx = tx
+            break
+    
+    if not selected_tx:
+        await q.answer("Ошибка: запись не найдена", show_alert=True)
+        return ST_EDIT_SELECT
+    
+    context.user_data["selected_transaction"] = selected_tx
+    
+    # Показываем детали записи
+    tx_type = selected_tx["type"]
+    emoji = "➖" if tx_type == "расход" else "➕"
+    date_str = selected_tx["date"][:16]  # YYYY-MM-DD HH:MM
+    cat = selected_tx["category"]
+    subcat = selected_tx.get("subcategory", "")
+    amt = selected_tx["amount"]
+    comment = selected_tx.get("comment", "")
+    
+    text = (
+        f"<b>{emoji} {tx_type.capitalize()}</b>\n"
+        f"📅 {date_str}\n"
+        f"📂 {cat}"
+    )
+    if subcat:
+        text += f" → {subcat}"
+    text += f"\n💰 {amt:,.2f} ₽".replace(",", " ")
+    if comment:
+        text += f"\n💬 {comment}"
+    
+    text += "\n\n<b>Что хочешь изменить?</b>"
+    
+    await q.edit_message_text(text, reply_markup=kb_edit_field(), parse_mode=ParseMode.HTML)
+    return ST_EDIT_FIELD
+
+
+async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь выбрал что редактировать"""
+    q = update.callback_query
+    await q.answer()
+
+    field = q.data.split(":")[1]
+    context.user_data["edit_field"] = field
+    
+    selected_tx = context.user_data.get("selected_transaction", {})
+    
+    if field == "delete":
+        # Удаление записи
+        row_id = selected_tx["row_id"]
+        await gas_request({"cmd": "delete_transaction", "row_id": row_id})
+        
+        await delete_working_message(context, update.effective_chat.id)
+        await update.effective_chat.send_message("✅ Запись удалена")
+        
+        txt = await month_screen_text()
+        await update.effective_chat.send_message(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+        return ST_MENU
+    
+    elif field == "amount":
+        current_amt = selected_tx.get("amount", 0)
+        await q.edit_message_text(
+            f"Текущая сумма: <b>{current_amt:,.2f}</b> ₽\n\n"
+            f"Введи новую сумму:\n"
+            f"(например: 2500 / 2 500 / 2к)".replace(",", " "),
+            parse_mode=ParseMode.HTML
+        )
+        return ST_EDIT_VALUE
+    
+    elif field == "comment":
+        current_comment = selected_tx.get("comment", "")
+        text = "Текущий комментарий: "
+        if current_comment:
+            text += f"<i>{current_comment}</i>"
+        else:
+            text += "<i>(пусто)</i>"
+        text += "\n\nВведи новый комментарий:"
+        
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML)
+        return ST_EDIT_VALUE
+    
+    return ST_EDIT_FIELD
+
+
+async def edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь ввел новое значение"""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return ConversationHandler.END
+
+    # Удаляем сообщение пользователя
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    field = context.user_data.get("edit_field")
+    selected_tx = context.user_data.get("selected_transaction", {})
+    row_id = selected_tx["row_id"]
+    
+    if field == "amount":
+        amt = parse_amount(update.message.text)
+        if amt is None or amt <= 0:
+            await delete_working_message(context, update.effective_chat.id)
+            msg = await update.effective_chat.send_message(
+                "Не понял сумму 🙈\nНапиши, пожалуйста, например: 2500 / 2 500 / 2к"
+            )
+            context.user_data["working_message_id"] = msg.message_id
+            return ST_EDIT_VALUE
+        
+        await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "amount", "value": amt})
+        
+        await delete_working_message(context, update.effective_chat.id)
+        await update.effective_chat.send_message(
+            f"✅ Сумма изменена на <b>{amt:,.2f}</b> ₽".replace(",", " "),
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif field == "comment":
+        comment = (update.message.text or "").strip()
+        await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "comment", "value": comment})
+        
+        await delete_working_message(context, update.effective_chat.id)
+        await update.effective_chat.send_message("✅ Комментарий изменен")
+    
+    # Показываем главный экран
+    txt = await month_screen_text()
+    await update.effective_chat.send_message(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+    
+    return ST_MENU
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -781,6 +984,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Кнопки внизу 🙂\n"
         "• Внести транзакцию\n"
+        "• Скорректировать записи\n"
         "• Анализ\n"
         "• Установить баланс"
     )
@@ -837,6 +1041,17 @@ def build_app() -> Application:
             ],
             ST_SET_BALANCE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, set_balance_received),
+            ],
+            ST_EDIT_SELECT: [
+                CallbackQueryHandler(edit_select_row, pattern=r"^edit_row:\d+$"),
+                CallbackQueryHandler(back_router, pattern=r"^back:"),
+            ],
+            ST_EDIT_FIELD: [
+                CallbackQueryHandler(edit_field_selected, pattern=r"^edit_field:"),
+                CallbackQueryHandler(back_router, pattern=r"^back:"),
+            ],
+            ST_EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value_received),
             ],
         },
         fallbacks=[CommandHandler("help", cmd_help)],
