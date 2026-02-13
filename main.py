@@ -315,7 +315,9 @@ DENY_TEXT = "Извини, доступ только для Иришки 🙂"
     ST_EDIT_FIELD,
     ST_EDIT_VALUE,
     ST_QUICK_CONFIRM,
-) = range(14)
+    ST_QUICK_EDIT_FIELD,
+    ST_QUICK_EDIT_VALUE,
+) = range(16)
 
 
 # =========================
@@ -411,8 +413,20 @@ def kb_quick_confirm() -> InlineKeyboardMarkup:
     """Клавиатура для подтверждения быстрой транзакции"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, сохранить", callback_data="quick:save")],
+        [InlineKeyboardButton("✏️ Изменить данные", callback_data="quick:edit")],
         [InlineKeyboardButton("❌ Отмена", callback_data="quick:cancel")],
     ])
+
+
+def kb_quick_edit() -> InlineKeyboardMarkup:
+    """Клавиатура для выбора что редактировать в быстрой транзакции"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Сумма", callback_data="quickedit:amount")],
+        [InlineKeyboardButton("📁 Категория", callback_data="quickedit:category")],
+        [InlineKeyboardButton("📝 Комментарий", callback_data="quickedit:comment")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="quickedit:back")],
+    ])
+
 
 
 def kb_quick_category_select(suggestions: List[str], tx_type: str) -> InlineKeyboardMarkup:
@@ -509,6 +523,9 @@ def parse_amount(text: str) -> Optional[float]:
 # =========================
 # Quick transaction parsing
 # =========================
+# Служебные слова, которые нужно пропускать при парсинге категории
+SKIP_WORDS = {'рублей', 'руб', 'рубля', 'рублик', 'рубликов', 'р', 'р.', '₽'}
+
 def quick_parse_transaction(text: str) -> tuple[Optional[Dict], Optional[str]]:
     """
     Парсит строку быстрого ввода типа:
@@ -527,7 +544,7 @@ def quick_parse_transaction(text: str) -> tuple[Optional[Dict], Optional[str]]:
     # Ищем все числа в строке
     amounts = re.findall(amount_pattern, text)
     if not amounts:
-        return None, "Не нашла сумму в сообщении 🙈\n\nПример: <i>продукты 1500</i> или <i>муж 50000</i>"
+        return None, "Не нашел сумму в сообщении 🙈\n\nПример: <i>продукты 1500</i> или <i>муж 50000</i>"
     
     # Берем первое найденное число как сумму
     amount = parse_amount(amounts[0])
@@ -539,8 +556,12 @@ def quick_parse_transaction(text: str) -> tuple[Optional[Dict], Optional[str]]:
     
     # Разделяем на слова
     words = text_without_amount.split()
+    
+    # Пропускаем служебные слова (рублей, руб и т.д.)
+    words = [w for w in words if w.lower() not in SKIP_WORDS]
+    
     if not words:
-        return None, "Не нашла категорию 🙈\n\nПример: <i>продукты 1500</i> или <i>1500 продукты</i>"
+        return None, "Не нашел категорию 🙈\n\nПример: <i>продукты 1500</i> или <i>1500 продукты</i>"
     
     # Первое слово - вероятная категория
     category_keyword = words[0]
@@ -607,7 +628,7 @@ def quick_parse_transaction(text: str) -> tuple[Optional[Dict], Optional[str]]:
     
     # Если ничего не нашли
     return None, (
-        f"Не нашла категорию '<i>{category_keyword}</i>' 🙈\n\n"
+        f"Не нашел категорию '<i>{category_keyword}</i>' 🙈\n\n"
         f"<b>Примеры расходов:</b>\n"
         f"продукты 1500\n"
         f"кафе 800\n"
@@ -729,22 +750,41 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tx_type = q.data.split(":")[1]
 
-    context.user_data["tx"] = {"type": "расход" if tx_type == "expense" else "доход"}
-
-    if tx_type == "expense":
-        msg = await q.edit_message_text(
-            random.choice(PH_EXP_CAT),
-            reply_markup=kb_expense_categories()
-        )
-        context.user_data["working_message_id"] = msg.message_id
-        return ST_EXP_CATEGORY
+    # Проверяем, пришли ли мы из быстрого редактирования
+    if context.user_data.get("quick_tx"):
+        # Быстрое редактирование - не создаем новый tx
+        if tx_type == "expense":
+            msg = await q.edit_message_text(
+                random.choice(PH_EXP_CAT),
+                reply_markup=kb_expense_categories()
+            )
+            context.user_data["working_message_id"] = msg.message_id
+            return ST_EXP_CATEGORY
+        else:
+            msg = await q.edit_message_text(
+                random.choice(PH_INC_CAT),
+                reply_markup=kb_income_categories()
+            )
+            context.user_data["working_message_id"] = msg.message_id
+            return ST_INC_CATEGORY
     else:
-        msg = await q.edit_message_text(
-            random.choice(PH_INC_CAT),
-            reply_markup=kb_income_categories()
-        )
-        context.user_data["working_message_id"] = msg.message_id
-        return ST_INC_CATEGORY
+        # Обычный flow
+        context.user_data["tx"] = {"type": "расход" if tx_type == "expense" else "доход"}
+
+        if tx_type == "expense":
+            msg = await q.edit_message_text(
+                random.choice(PH_EXP_CAT),
+                reply_markup=kb_expense_categories()
+            )
+            context.user_data["working_message_id"] = msg.message_id
+            return ST_EXP_CATEGORY
+        else:
+            msg = await q.edit_message_text(
+                random.choice(PH_INC_CAT),
+                reply_markup=kb_income_categories()
+            )
+            context.user_data["working_message_id"] = msg.message_id
+            return ST_INC_CATEGORY
 
 
 async def expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -755,18 +795,34 @@ async def expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cats = list(EXPENSES.keys())
     cat = cats[idx]
 
-    tx = context.user_data.get("tx", {})
-    tx["category"] = cat
-    context.user_data["tx"] = tx
+    # Проверяем, пришли ли мы из быстрого редактирования
+    if context.user_data.get("quick_tx"):
+        quick_tx = context.user_data.get("quick_tx", {})
+        quick_tx["category"] = cat
+        quick_tx["type"] = "расход"
+        context.user_data["quick_tx"] = quick_tx
+        
+        phrase = random.choice(PH_EXP_SUB).replace("{cat}", cat)
+        msg = await q.edit_message_text(
+            phrase,
+            reply_markup=kb_expense_subcategories(cat),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data["working_message_id"] = msg.message_id
+        return ST_EXP_SUBCATEGORY
+    else:
+        tx = context.user_data.get("tx", {})
+        tx["category"] = cat
+        context.user_data["tx"] = tx
 
-    phrase = random.choice(PH_EXP_SUB).replace("{cat}", cat)
-    msg = await q.edit_message_text(
-        phrase,
-        reply_markup=kb_expense_subcategories(cat),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    context.user_data["working_message_id"] = msg.message_id
-    return ST_EXP_SUBCATEGORY
+        phrase = random.choice(PH_EXP_SUB).replace("{cat}", cat)
+        msg = await q.edit_message_text(
+            phrase,
+            reply_markup=kb_expense_subcategories(cat),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data["working_message_id"] = msg.message_id
+        return ST_EXP_SUBCATEGORY
 
 
 async def expense_subcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -774,17 +830,50 @@ async def expense_subcategory(update: Update, context: ContextTypes.DEFAULT_TYPE
     await q.answer()
 
     idx = int(q.data.split(":")[1])
-    tx = context.user_data.get("tx", {})
-    cat = tx.get("category")
-    subs = EXPENSES.get(cat, [])
-    sub = subs[idx]
+    
+    # Проверяем, пришли ли мы из быстрого редактирования
+    if context.user_data.get("quick_tx"):
+        # Быстрое редактирование
+        quick_tx = context.user_data.get("quick_tx", {})
+        cat = quick_tx.get("category")
+        subs = EXPENSES.get(cat, [])
+        sub = subs[idx]
+        
+        quick_tx["subcategory"] = sub
+        context.user_data["quick_tx"] = quick_tx
+        
+        # Возвращаем к подтверждению
+        emoji = '➖'
+        text = (
+            f"{emoji} <b>Расход</b>\n"
+            f"💰 Сумма: <b>{quick_tx.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ") +
+            f"📁 Категория: {cat} → {sub}"
+        )
+        
+        if quick_tx.get('comment'):
+            text += f"\n📝 Комментарий: {quick_tx.get('comment')}"
+        
+        text += "\n\n<b>Всё верно?</b>"
+        
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_quick_confirm()
+        )
+        return ST_QUICK_CONFIRM
+    else:
+        # Обычный flow
+        tx = context.user_data.get("tx", {})
+        cat = tx.get("category")
+        subs = EXPENSES.get(cat, [])
+        sub = subs[idx]
 
-    tx["subcategory"] = sub
-    context.user_data["tx"] = tx
+        tx["subcategory"] = sub
+        context.user_data["tx"] = tx
 
-    msg = await q.edit_message_text(random.choice(PH_AMOUNT_EXP))
-    context.user_data["working_message_id"] = msg.message_id
-    return ST_AMOUNT
+        msg = await q.edit_message_text(random.choice(PH_AMOUNT_EXP))
+        context.user_data["working_message_id"] = msg.message_id
+        return ST_AMOUNT
 
 
 async def income_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -794,14 +883,42 @@ async def income_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = int(q.data.split(":")[1])
     cat = INCOME_CATEGORIES[idx]
 
-    tx = context.user_data.get("tx", {})
-    tx["category"] = cat
-    tx["subcategory"] = ""
-    context.user_data["tx"] = tx
+    # Проверяем, пришли ли мы из быстрого редактирования
+    if context.user_data.get("quick_tx"):
+        quick_tx = context.user_data.get("quick_tx", {})
+        quick_tx["category"] = cat
+        quick_tx["type"] = "доход"
+        quick_tx["subcategory"] = ""
+        context.user_data["quick_tx"] = quick_tx
+        
+        # Возвращаем к подтверждению
+        emoji = '➕'
+        text = (
+            f"{emoji} <b>Доход</b>\n"
+            f"💰 Сумма: <b>{quick_tx.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ") +
+            f"📁 Категория: {cat}"
+        )
+        
+        if quick_tx.get('comment'):
+            text += f"\n📝 Комментарий: {quick_tx.get('comment')}"
+        
+        text += "\n\n<b>Всё верно?</b>"
+        
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_quick_confirm()
+        )
+        return ST_QUICK_CONFIRM
+    else:
+        tx = context.user_data.get("tx", {})
+        tx["category"] = cat
+        tx["subcategory"] = ""
+        context.user_data["tx"] = tx
 
-    msg = await q.edit_message_text(random.choice(PH_AMOUNT_INC))
-    context.user_data["working_message_id"] = msg.message_id
-    return ST_AMOUNT
+        msg = await q.edit_message_text(random.choice(PH_AMOUNT_INC))
+        context.user_data["working_message_id"] = msg.message_id
+        return ST_AMOUNT
 
 
 async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1391,6 +1508,178 @@ async def quick_confirm_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
     return ST_MENU
 
 
+async def quick_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать меню редактирования быстрой транзакции"""
+    q = update.callback_query
+    await q.answer()
+    
+    quick_tx = context.user_data.get("quick_tx", {})
+    
+    emoji = '➖' if quick_tx.get('type') == 'расход' else '➕'
+    text = (
+        f"<b>Что хочешь изменить?</b>\n\n"
+        f"{emoji} Тип: <b>{quick_tx.get('type', '?')}</b>\n"
+        f"💰 Сумма: <b>{quick_tx.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ") +
+        f"📁 Категория: {quick_tx.get('category', '?')}"
+    )
+    
+    if quick_tx.get('type') == 'расход' and quick_tx.get('subcategory'):
+        text += f" → {quick_tx.get('subcategory')}"
+    
+    if quick_tx.get('comment'):
+        text += f"\n📝 Комментарий: {quick_tx.get('comment')}"
+    
+    await q.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_quick_edit()
+    )
+    
+    return ST_QUICK_EDIT_FIELD
+
+
+async def quick_edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора поля для редактирования"""
+    q = update.callback_query
+    await q.answer()
+    
+    field = q.data.split(":")[1]
+    
+    if field == "back":
+        # Вернуться к подтверждению
+        quick_tx = context.user_data.get("quick_tx", {})
+        
+        emoji = '➖' if quick_tx.get('type') == 'расход' else '➕'
+        text = (
+            f"{emoji} <b>{quick_tx.get('type', '?').capitalize()}</b>\n"
+            f"💰 Сумма: <b>{quick_tx.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ") +
+            f"📁 Категория: {quick_tx.get('category', '?')}"
+        )
+        
+        if quick_tx.get('type') == 'расход' and quick_tx.get('subcategory'):
+            text += f" → {quick_tx.get('subcategory')}"
+        
+        if quick_tx.get('comment'):
+            text += f"\n📝 Комментарий: {quick_tx.get('comment')}"
+        
+        text += "\n\n<b>Всё верно?</b>"
+        
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_quick_confirm()
+        )
+        return ST_QUICK_CONFIRM
+    
+    context.user_data["quick_edit_field"] = field
+    
+    quick_tx = context.user_data.get("quick_tx", {})
+    
+    if field == "amount":
+        current = quick_tx.get('amount', 0)
+        await q.edit_message_text(
+            f"Текущая сумма: <b>{current:,.2f}</b> ₽\n\n"
+            f"Введи новую сумму:\n"
+            f"(например: 2500 / 2 500 / 2к)".replace(",", " "),
+            parse_mode=ParseMode.HTML
+        )
+    elif field == "category":
+        await q.edit_message_text(
+            "Выбери тип транзакции:",
+            reply_markup=kb_choose_type()
+        )
+        # Переходим в обычный flow выбора категории
+        return ST_ADD_CHOOSE_TYPE
+    elif field == "comment":
+        current = quick_tx.get('comment', '')
+        text = "Текущий комментарий: "
+        if current:
+            text += f"<i>{current}</i>"
+        else:
+            text += "<i>(пусто)</i>"
+        text += "\n\nВведи новый комментарий:"
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML)
+    
+    return ST_QUICK_EDIT_VALUE
+
+
+async def quick_edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка введенного нового значения"""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return ConversationHandler.END
+    
+    # Удаляем сообщение пользователя
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    
+    field = context.user_data.get("quick_edit_field")
+    quick_tx = context.user_data.get("quick_tx", {})
+    
+    if field == "amount":
+        amt = parse_amount(update.message.text)
+        if amt is None or amt <= 0:
+            msg = await update.effective_chat.send_message(
+                "Не понял сумму 🙈\nНапиши, пожалуйста, например: 2500 / 2 500 / 2к"
+            )
+            context.user_data["working_message_id"] = msg.message_id
+            return ST_QUICK_EDIT_VALUE
+        quick_tx['amount'] = amt
+        context.user_data["quick_tx"] = quick_tx
+    
+    elif field == "comment":
+        comment = (update.message.text or "").strip()
+        quick_tx['comment'] = comment
+        context.user_data["quick_tx"] = quick_tx
+    
+    # Показываем обновленное подтверждение
+    emoji = '➖' if quick_tx.get('type') == 'расход' else '➕'
+    text = (
+        f"{emoji} <b>{quick_tx.get('type', '?').capitalize()}</b>\n"
+        f"💰 Сумма: <b>{quick_tx.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ") +
+        f"📁 Категория: {quick_tx.get('category', '?')}"
+    )
+    
+    if quick_tx.get('type') == 'расход' and quick_tx.get('subcategory'):
+        text += f" → {quick_tx.get('subcategory')}"
+    
+    if quick_tx.get('comment'):
+        text += f"\n📝 Комментарий: {quick_tx.get('comment')}"
+    
+    text += "\n\n<b>Всё верно?</b>"
+    
+    await update.effective_chat.send_message(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_quick_confirm()
+    )
+    
+    return ST_QUICK_CONFIRM
+
+
+async def quick_confirm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена быстрой транзакции"""
+    q = update.callback_query
+    await q.answer()
+    
+    await q.edit_message_text("Отменено ❌")
+    
+    # Очищаем данные
+    context.user_data.pop("quick_tx", None)
+    
+    # Показываем главный экран
+    txt_month = await month_screen_text()
+    await update.effective_chat.send_message(
+        txt_month,
+        reply_markup=kb_main(),
+        parse_mode=ParseMode.HTML
+    )
+    
+    return ST_MENU
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -1480,7 +1769,14 @@ def build_app() -> Application:
             ST_QUICK_CONFIRM: [
                 CallbackQueryHandler(quick_category_selected, pattern=r"^quickcat:\d+$"),
                 CallbackQueryHandler(quick_confirm_save, pattern=r"^quick:save$"),
+                CallbackQueryHandler(quick_edit_menu, pattern=r"^quick:edit$"),
                 CallbackQueryHandler(quick_confirm_cancel, pattern=r"^quick:cancel$"),
+            ],
+            ST_QUICK_EDIT_FIELD: [
+                CallbackQueryHandler(quick_edit_field_selected, pattern=r"^quickedit:"),
+            ],
+            ST_QUICK_EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, quick_edit_value_received),
             ],
         },
         fallbacks=[CommandHandler("help", cmd_help)],
