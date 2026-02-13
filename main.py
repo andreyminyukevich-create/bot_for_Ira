@@ -1430,6 +1430,7 @@ def build_app() -> Application:
         states={
             ST_MENU: [
                 CallbackQueryHandler(on_menu, pattern=r"^menu:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quick_input),
             ],
             ST_ADD_CHOOSE_TYPE: [
                 CallbackQueryHandler(choose_type, pattern=r"^type:"),
