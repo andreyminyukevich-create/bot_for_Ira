@@ -418,14 +418,55 @@ def kb_quick_confirm() -> InlineKeyboardMarkup:
     ])
 
 
-def kb_quick_edit() -> InlineKeyboardMarkup:
-    """Клавиатура для выбора что редактировать в быстрой транзакции"""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Сумма", callback_data="quickedit:amount")],
-        [InlineKeyboardButton("📁 Категория", callback_data="quickedit:category")],
-        [InlineKeyboardButton("📝 Комментарий", callback_data="quickedit:comment")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="quickedit:back")],
-    ])
+def kb_quick_edit(quick_tx: Dict) -> InlineKeyboardMarkup:
+    """Клавиатура для редактирования быстрой транзакции с отображением текущих значений"""
+    tx_type = quick_tx.get('type', 'расход')
+    amount = quick_tx.get('amount', 0)
+    category = quick_tx.get('category', '?')
+    subcategory = quick_tx.get('subcategory', '')
+    comment = quick_tx.get('comment', '')
+    
+    emoji = '➖' if tx_type == 'расход' else '➕'
+    
+    buttons = []
+    
+    # Тип
+    buttons.append([InlineKeyboardButton(
+        f"Тип: {emoji} {tx_type.capitalize()}", 
+        callback_data="quickedit:type"
+    )])
+    
+    # Сумма
+    buttons.append([InlineKeyboardButton(
+        f"💰 Сумма: {amount:,.0f} ₽".replace(",", " "), 
+        callback_data="quickedit:amount"
+    )])
+    
+    # Категория
+    buttons.append([InlineKeyboardButton(
+        f"📁 Категория: {category}", 
+        callback_data="quickedit:category"
+    )])
+    
+    # Подкатегория (только для расходов)
+    if tx_type == 'расход':
+        subcat_text = subcategory if subcategory else "(не указана)"
+        buttons.append([InlineKeyboardButton(
+            f"📂 Подкатегория: {subcat_text}", 
+            callback_data="quickedit:subcategory"
+        )])
+    
+    # Комментарий
+    comment_preview = comment[:20] + "..." if len(comment) > 20 else comment
+    comment_text = f"📝 Комментарий: {comment_preview}" if comment else "📝 Комментарий: (пусто)"
+    buttons.append([InlineKeyboardButton(
+        comment_text, 
+        callback_data="quickedit:comment"
+    )])
+    
+    buttons.append([InlineKeyboardButton("⬅️ Назад к подтверждению", callback_data="quickedit:back")])
+    
+    return InlineKeyboardMarkup(buttons)
 
 
 
@@ -566,8 +607,11 @@ def quick_parse_transaction(text: str) -> tuple[Optional[Dict], Optional[str]]:
     # Первое слово - вероятная категория
     category_keyword = words[0]
     
-    # Остальное - комментарий
-    comment = ' '.join(words[1:]) if len(words) > 1 else ''
+    # Остальные слова - потенциальный комментарий
+    # Убираем слова-алиасы категорий (они избыточны)
+    all_aliases_lower = {k.lower() for k in EXPENSE_ALIASES.keys()} | {k.lower() for k in INCOME_ALIASES.keys()}
+    comment_words = [w for w in words[1:] if w not in all_aliases_lower]
+    comment = ' '.join(comment_words)
     
     # Сначала проверяем алиасы доходов
     if category_keyword in INCOME_ALIASES:
@@ -796,7 +840,34 @@ async def expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = cats[idx]
 
     # Проверяем, пришли ли мы из быстрого редактирования
-    if context.user_data.get("quick_tx"):
+    if context.user_data.get("quick_edit_field") == "category":
+        quick_tx = context.user_data.get("quick_tx", {})
+        quick_tx["category"] = cat
+        quick_tx["type"] = "расход"
+        context.user_data["quick_tx"] = quick_tx
+        
+        phrase = random.choice(PH_EXP_SUB).replace("{cat}", cat)
+        await q.edit_message_text(
+            phrase,
+            reply_markup=kb_expense_subcategories(cat),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ST_QUICK_EDIT_VALUE
+    elif context.user_data.get("quick_edit_field") == "subcategory":
+        # Не должны сюда попасть, но на всякий случай
+        quick_tx = context.user_data.get("quick_tx", {})
+        quick_tx["category"] = cat
+        context.user_data["quick_tx"] = quick_tx
+        
+        phrase = random.choice(PH_EXP_SUB).replace("{cat}", cat)
+        await q.edit_message_text(
+            phrase,
+            reply_markup=kb_expense_subcategories(cat),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ST_QUICK_EDIT_VALUE
+    elif context.user_data.get("quick_tx"):
+        # Старый путь быстрого редактирования (сейчас не используется)
         quick_tx = context.user_data.get("quick_tx", {})
         quick_tx["category"] = cat
         quick_tx["type"] = "расход"
@@ -832,8 +903,24 @@ async def expense_subcategory(update: Update, context: ContextTypes.DEFAULT_TYPE
     idx = int(q.data.split(":")[1])
     
     # Проверяем, пришли ли мы из быстрого редактирования
-    if context.user_data.get("quick_tx"):
-        # Быстрое редактирование
+    if context.user_data.get("quick_edit_field") in ["category", "subcategory"]:
+        quick_tx = context.user_data.get("quick_tx", {})
+        cat = quick_tx.get("category")
+        subs = EXPENSES.get(cat, [])
+        sub = subs[idx]
+        
+        quick_tx["subcategory"] = sub
+        context.user_data["quick_tx"] = quick_tx
+        
+        # Возвращаемся в меню редактирования
+        await q.edit_message_text(
+            "<b>Что хочешь изменить?</b>\n\nНажми на поле для редактирования:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_quick_edit(quick_tx)
+        )
+        return ST_QUICK_EDIT_FIELD
+    elif context.user_data.get("quick_tx"):
+        # Старый путь (сейчас не используется)
         quick_tx = context.user_data.get("quick_tx", {})
         cat = quick_tx.get("category")
         subs = EXPENSES.get(cat, [])
@@ -884,7 +971,22 @@ async def income_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = INCOME_CATEGORIES[idx]
 
     # Проверяем, пришли ли мы из быстрого редактирования
-    if context.user_data.get("quick_tx"):
+    if context.user_data.get("quick_edit_field") == "category":
+        quick_tx = context.user_data.get("quick_tx", {})
+        quick_tx["category"] = cat
+        quick_tx["type"] = "доход"
+        quick_tx["subcategory"] = ""
+        context.user_data["quick_tx"] = quick_tx
+        
+        # Возвращаемся в меню редактирования
+        await q.edit_message_text(
+            "<b>Что хочешь изменить?</b>\n\nНажми на поле для редактирования:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_quick_edit(quick_tx)
+        )
+        return ST_QUICK_EDIT_FIELD
+    elif context.user_data.get("quick_tx"):
+        # Старый путь (сейчас не используется)
         quick_tx = context.user_data.get("quick_tx", {})
         quick_tx["category"] = cat
         quick_tx["type"] = "доход"
@@ -1052,12 +1154,19 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     period = q.data.split(":")[1]
     kind = context.user_data.get("analysis_kind", "expense")
+    
+    # Преобразуем из английского в русский для Google Sheets
+    kind_map = {
+        "expense": "расход",
+        "income": "доход"
+    }
+    kind_rus = kind_map.get(kind, "расход")
 
     await delete_working_message(context, update.effective_chat.id)
 
     result = await gas_request({
         "cmd": "analysis",
-        "kind": kind,
+        "kind": kind_rus,  # Отправляем по-русски!
         "period": period
     })
 
@@ -1125,6 +1234,17 @@ async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     dest = q.data.split(":")[1]
+    
+    # Проверяем, находимся ли в режиме quick_edit
+    if context.user_data.get("quick_edit_field"):
+        # Возврат в меню редактирования
+        quick_tx = context.user_data.get("quick_tx", {})
+        await q.edit_message_text(
+            "<b>Что хочешь изменить?</b>\n\nНажми на поле для редактирования:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_quick_edit(quick_tx)
+        )
+        return ST_QUICK_EDIT_FIELD
 
     if dest == "menu":
         await delete_working_message(context, update.effective_chat.id)
@@ -1483,27 +1603,7 @@ async def quick_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # Очищаем данные
     context.user_data.pop("quick_tx", None)
-    
-    return ST_MENU
-
-
-async def quick_confirm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена быстрой транзакции"""
-    q = update.callback_query
-    await q.answer()
-    
-    await q.edit_message_text("Отменено ❌")
-    
-    # Очищаем данные
-    context.user_data.pop("quick_tx", None)
-    
-    # Показываем главный экран
-    txt_month = await month_screen_text()
-    await update.effective_chat.send_message(
-        txt_month,
-        reply_markup=kb_main(),
-        parse_mode=ParseMode.HTML
-    )
+    context.user_data.pop("quick_edit_field", None)  # ВАЖНО!
     
     return ST_MENU
 
@@ -1515,24 +1615,10 @@ async def quick_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     quick_tx = context.user_data.get("quick_tx", {})
     
-    emoji = '➖' if quick_tx.get('type') == 'расход' else '➕'
-    text = (
-        f"<b>Что хочешь изменить?</b>\n\n"
-        f"{emoji} Тип: <b>{quick_tx.get('type', '?')}</b>\n"
-        f"💰 Сумма: <b>{quick_tx.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ") +
-        f"📁 Категория: {quick_tx.get('category', '?')}"
-    )
-    
-    if quick_tx.get('type') == 'расход' and quick_tx.get('subcategory'):
-        text += f" → {quick_tx.get('subcategory')}"
-    
-    if quick_tx.get('comment'):
-        text += f"\n📝 Комментарий: {quick_tx.get('comment')}"
-    
     await q.edit_message_text(
-        text,
+        "<b>Что хочешь изменить?</b>\n\nНажми на поле для редактирования:",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_quick_edit()
+        reply_markup=kb_quick_edit(quick_tx)
     )
     
     return ST_QUICK_EDIT_FIELD
@@ -1548,6 +1634,9 @@ async def quick_edit_field_selected(update: Update, context: ContextTypes.DEFAUL
     if field == "back":
         # Вернуться к подтверждению
         quick_tx = context.user_data.get("quick_tx", {})
+        
+        # ВАЖНО: очищаем флаг редактирования
+        context.user_data.pop("quick_edit_field", None)
         
         emoji = '➖' if quick_tx.get('type') == 'расход' else '➕'
         text = (
@@ -1572,10 +1661,22 @@ async def quick_edit_field_selected(update: Update, context: ContextTypes.DEFAUL
         return ST_QUICK_CONFIRM
     
     context.user_data["quick_edit_field"] = field
-    
     quick_tx = context.user_data.get("quick_tx", {})
     
-    if field == "amount":
+    if field == "type":
+        # Показываем кнопки выбора типа
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➖ Расход", callback_data="quicktype:expense")],
+            [InlineKeyboardButton("➕ Доход", callback_data="quicktype:income")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="quicktype:back")],
+        ])
+        await q.edit_message_text(
+            "Выбери тип транзакции:",
+            reply_markup=kb
+        )
+        return ST_QUICK_EDIT_VALUE
+    
+    elif field == "amount":
         current = quick_tx.get('amount', 0)
         await q.edit_message_text(
             f"Текущая сумма: <b>{current:,.2f}</b> ₽\n\n"
@@ -1583,13 +1684,36 @@ async def quick_edit_field_selected(update: Update, context: ContextTypes.DEFAUL
             f"(например: 2500 / 2 500 / 2к)".replace(",", " "),
             parse_mode=ParseMode.HTML
         )
+        return ST_QUICK_EDIT_VALUE
+    
     elif field == "category":
-        await q.edit_message_text(
-            "Выбери тип транзакции:",
-            reply_markup=kb_choose_type()
-        )
-        # Переходим в обычный flow выбора категории
-        return ST_ADD_CHOOSE_TYPE
+        # Показываем категории в зависимости от типа
+        tx_type = quick_tx.get('type', 'расход')
+        if tx_type == 'расход':
+            await q.edit_message_text(
+                "Выбери категорию расхода:",
+                reply_markup=kb_expense_categories()
+            )
+        else:
+            await q.edit_message_text(
+                "Выбери категорию дохода:",
+                reply_markup=kb_income_categories()
+            )
+        return ST_QUICK_EDIT_VALUE
+    
+    elif field == "subcategory":
+        category = quick_tx.get('category')
+        if category:
+            await q.edit_message_text(
+                f"Выбери подкатегорию в <b>{category}</b>:",
+                reply_markup=kb_expense_subcategories(category),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await q.answer("Сначала выбери категорию", show_alert=True)
+            return ST_QUICK_EDIT_FIELD
+        return ST_QUICK_EDIT_VALUE
+    
     elif field == "comment":
         current = quick_tx.get('comment', '')
         text = "Текущий комментарий: "
@@ -1599,8 +1723,9 @@ async def quick_edit_field_selected(update: Update, context: ContextTypes.DEFAUL
             text += "<i>(пусто)</i>"
         text += "\n\nВведи новый комментарий:"
         await q.edit_message_text(text, parse_mode=ParseMode.HTML)
+        return ST_QUICK_EDIT_VALUE
     
-    return ST_QUICK_EDIT_VALUE
+    return ST_QUICK_EDIT_FIELD
 
 
 async def quick_edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1634,29 +1759,53 @@ async def quick_edit_value_received(update: Update, context: ContextTypes.DEFAUL
         quick_tx['comment'] = comment
         context.user_data["quick_tx"] = quick_tx
     
-    # Показываем обновленное подтверждение
-    emoji = '➖' if quick_tx.get('type') == 'расход' else '➕'
-    text = (
-        f"{emoji} <b>{quick_tx.get('type', '?').capitalize()}</b>\n"
-        f"💰 Сумма: <b>{quick_tx.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ") +
-        f"📁 Категория: {quick_tx.get('category', '?')}"
-    )
-    
-    if quick_tx.get('type') == 'расход' and quick_tx.get('subcategory'):
-        text += f" → {quick_tx.get('subcategory')}"
-    
-    if quick_tx.get('comment'):
-        text += f"\n📝 Комментарий: {quick_tx.get('comment')}"
-    
-    text += "\n\n<b>Всё верно?</b>"
-    
+    # Возвращаемся в меню редактирования (не сразу к подтверждению!)
     await update.effective_chat.send_message(
-        text,
+        "<b>Что хочешь изменить?</b>\n\nНажми на поле для редактирования:",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_quick_confirm()
+        reply_markup=kb_quick_edit(quick_tx)
     )
     
-    return ST_QUICK_CONFIRM
+    return ST_QUICK_EDIT_FIELD
+
+
+async def quick_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора типа при редактировании"""
+    q = update.callback_query
+    await q.answer()
+    
+    action = q.data.split(":")[1]
+    
+    if action == "back":
+        quick_tx = context.user_data.get("quick_tx", {})
+        await q.edit_message_text(
+            "<b>Что хочешь изменить?</b>\n\nНажми на поле для редактирования:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_quick_edit(quick_tx)
+        )
+        return ST_QUICK_EDIT_FIELD
+    
+    quick_tx = context.user_data.get("quick_tx", {})
+    old_type = quick_tx.get('type')
+    new_type = "расход" if action == "expense" else "доход"
+    
+    quick_tx['type'] = new_type
+    
+    # Если тип изменился, сбрасываем категорию и подкатегорию
+    if old_type != new_type:
+        quick_tx['category'] = '?'
+        quick_tx['subcategory'] = ''
+    
+    context.user_data["quick_tx"] = quick_tx
+    
+    # Возвращаемся в меню редактирования
+    await q.edit_message_text(
+        "<b>Что хочешь изменить?</b>\n\nНажми на поле для редактирования:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_quick_edit(quick_tx)
+    )
+    
+    return ST_QUICK_EDIT_FIELD
 
 
 async def quick_confirm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1668,6 +1817,7 @@ async def quick_confirm_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Очищаем данные
     context.user_data.pop("quick_tx", None)
+    context.user_data.pop("quick_edit_field", None)  # ВАЖНО!
     
     # Показываем главный экран
     txt_month = await month_screen_text()
@@ -1776,6 +1926,11 @@ def build_app() -> Application:
                 CallbackQueryHandler(quick_edit_field_selected, pattern=r"^quickedit:"),
             ],
             ST_QUICK_EDIT_VALUE: [
+                CallbackQueryHandler(quick_type_selected, pattern=r"^quicktype:"),
+                CallbackQueryHandler(expense_category, pattern=r"^expcat:\d+$"),
+                CallbackQueryHandler(expense_subcategory, pattern=r"^expsub:\d+$"),
+                CallbackQueryHandler(income_category, pattern=r"^inccat:\d+$"),
+                CallbackQueryHandler(back_router, pattern=r"^back:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, quick_edit_value_received),
             ],
         },
