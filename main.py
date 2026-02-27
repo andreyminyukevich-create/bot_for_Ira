@@ -614,8 +614,15 @@ async def expense_subcategory(update: Update, context: ContextTypes.DEFAULT_TYPE
     tx = context.user_data.get("tx", {})
     tx["subcategory"] = EXPENSES.get(tx.get("category"), [])[idx]
     context.user_data["tx"] = tx
+    logger.info("HANDLER expense_subcategory cat=%s sub=%s", tx.get("category"), tx.get("subcategory"))
 
-    await q.edit_message_text(random.choice(PH_AMOUNT_EXP))
+    # Убираем кнопки со старого сообщения
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    # Шлём новое сообщение — жена точно видит его внизу чата
+    await update.effective_chat.send_message(random.choice(PH_AMOUNT_EXP))
     return ST_AMOUNT
 
 
@@ -627,8 +634,13 @@ async def income_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx["category"] = INCOME_CATEGORIES[idx]
     tx["subcategory"] = ""
     context.user_data["tx"] = tx
+    logger.info("HANDLER income_category cat=%s", tx.get("category"))
 
-    await q.edit_message_text(random.choice(PH_AMOUNT_INC))
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await update.effective_chat.send_message(random.choice(PH_AMOUNT_INC))
     return ST_AMOUNT
 
 
@@ -636,6 +648,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
+    logger.info("HANDLER amount_received text=%r", update.message.text)
 
     try:
         await update.message.delete()
@@ -661,6 +674,7 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def comment_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    logger.info("HANDLER comment_skip")
     tx = context.user_data.get("tx", {})
     tx["comment"] = ""
     context.user_data["tx"] = tx
@@ -672,6 +686,7 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
+    logger.info("HANDLER comment_received text=%r", update.message.text)
 
     try:
         await update.message.delete()
@@ -692,6 +707,8 @@ async def save_and_finish(
 ) -> None:
     """Сохраняет транзакцию, всегда шлёт новое сообщение с итогом."""
     tx = context.user_data.get("tx", {})
+    logger.info("HANDLER save_and_finish type=%s cat=%s sub=%s amount=%s via_callback=%s",
+                tx.get("type"), tx.get("category"), tx.get("subcategory"), tx.get("amount"), via_callback)
     _invalidate_month_cache()
 
     # Убираем кнопку "Пропустить" со старого сообщения
@@ -730,11 +747,20 @@ async def save_and_finish(
     if tx.get("comment", "").strip():
         detail += f"\n💬 {tx['comment'].strip()}"
 
-    month_txt = await safe_month_text()
-    text = f"{header}\n{detail}\n\n{month_txt}" if month_txt else f"{header}\n{detail}"
+    # Шлём сообщение "Записано", ждём 2 сек, удаляем, показываем главный экран
+    confirm_msg = await update.effective_chat.send_message(
+        f"{header}\n{detail}", parse_mode=ParseMode.HTML
+    )
+    await asyncio.sleep(2)
+    try:
+        await confirm_msg.delete()
+    except Exception:
+        pass
 
-    # Всегда новое сообщение — видно внизу чата, не теряется
-    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
+    month_txt = await safe_month_text()
+    await update.effective_chat.send_message(
+        month_txt or "Главное меню", parse_mode=ParseMode.HTML, reply_markup=kb_main()
+    )
 
 
 async def analysis_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
