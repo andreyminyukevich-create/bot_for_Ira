@@ -1,7 +1,10 @@
 import os
 import re
+import time
 import random
+import signal
 import logging
+import asyncio
 import hashlib
 from typing import Optional, Dict, Any, List
 
@@ -37,7 +40,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SCRIPT_URL = os.getenv("SCRIPT_URL", "").strip()
 WIFE_TG_ID = int(os.getenv("WIFE_TG_ID", "0").strip() or 0)
 
-# Для webhook (Railway)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()
@@ -53,6 +55,50 @@ if not WIFE_TG_ID:
 def _default_webhook_path() -> str:
     h = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()
     return f"tg/{h[:24]}"
+
+
+# =========================
+# Persistent HTTP session
+# =========================
+_http_session: Optional[aiohttp.ClientSession] = None
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Возвращает единую сессию, пересоздаёт если закрыта."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        timeout = aiohttp.ClientTimeout(total=15)
+        _http_session = aiohttp.ClientSession(timeout=timeout)
+        logger.info("HTTP session created")
+    return _http_session
+
+
+async def close_http_session() -> None:
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        logger.info("HTTP session closed")
+
+
+# =========================
+# Month summary cache (60 sec)
+# =========================
+_month_cache: Dict[str, Any] = {}
+CACHE_TTL = 60  # секунд
+
+
+def _invalidate_month_cache() -> None:
+    _month_cache.clear()
+
+
+async def _fetch_month_summary() -> Dict[str, Any]:
+    now = time.monotonic()
+    if _month_cache.get("ts") and now - _month_cache["ts"] < CACHE_TTL:
+        return _month_cache["data"]
+    data = await gas_request({"cmd": "summary_month"})
+    _month_cache["data"] = data
+    _month_cache["ts"] = now
+    return data
 
 
 # =========================
@@ -123,16 +169,16 @@ PH_EXP_CAT = [
     "Куда улетели денежки? 🙂",
 ]
 PH_EXP_SUB = [
-    "*{cat}*, а точнее?",
-    "Понял(а). А внутри *{cat}* — что именно?",
-    "Уточним: *{cat}* → какой пункт?",
-    "Что конкретно в *{cat}*?",
-    "Окей, а точнее в *{cat}*?",
+    "<b>{cat}</b>, а точнее?",
+    "Понял. А внутри <b>{cat}</b> — что именно?",
+    "Уточним: <b>{cat}</b> → какой пункт?",
+    "Что конкретно в <b>{cat}</b>?",
+    "Окей, а точнее в <b>{cat}</b>?",
     "Выбери подкатегорию, пожалуйста.",
     "Какая подкатегория подходит лучше всего?",
-    "В *{cat}* какой раздел?",
-    "Давай точнее в рамках *{cat}*.",
-    "Что именно из *{cat}*?",
+    "В <b>{cat}</b> какой раздел?",
+    "Давай точнее в рамках <b>{cat}</b>.",
+    "Что именно из <b>{cat}</b>?",
 ]
 PH_AMOUNT_EXP = [
     "И сколько там?",
@@ -147,7 +193,7 @@ PH_AMOUNT_EXP = [
     "Ммм, и сколько там?",
 ]
 PH_COMMENT_EXP = [
-    "Да норм, это недорого! Добавишь коммент?",
+    "Записала! Добавишь коммент?",
     "Коммент добавим или пропускаем?",
     "Хочешь уточнение для себя? (необязательно)",
     "Добавим короткий коммент? 🙂",
@@ -161,7 +207,7 @@ PH_COMMENT_EXP = [
 PH_SAVED_EXP = [
     "Всё понял, записал ✅",
     "Готово ✅ Зафиксировал.",
-    "Записано ✅ Спасибо.",
+    "Записано ✅",
     "Есть ✅ Сохранил.",
     "Сделано ✅",
     "Принял ✅ Добавил в таблицу.",
@@ -170,7 +216,6 @@ PH_SAVED_EXP = [
     "Отлично ✅ Внес.",
     "Готово ✅",
 ]
-
 PH_INC_CAT = [
     "Опачки, денежки! И кто такой добрый?",
     "Ого! Доходик пришёл 🙂 От кого?",
@@ -221,6 +266,7 @@ PH_SAVED_INC = [
 ]
 
 DENY_TEXT = "Извини, доступ только для Иришки 🙂"
+GAS_ERROR_TEXT = "Не получилось связаться с таблицей 🙈 Попробуй ещё раз."
 
 
 # =========================
@@ -244,9 +290,9 @@ DENY_TEXT = "Извини, доступ только для Иришки 🙂"
 
 
 # =========================
-# Helpers: temp messages
+# Helpers
 # =========================
-async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     msg_id = context.user_data.get("working_message_id")
     if msg_id:
         try:
@@ -256,14 +302,20 @@ async def delete_working_message(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     context.user_data["working_message_id"] = None
 
 
-# =========================
-# Helpers: keyboards
-# =========================
+def reset_dialog(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасывает состояние диалога при ошибке."""
+    for key in ("tx", "edit_transactions", "selected_transaction", "edit_field", "analysis_kind", "working_message_id"):
+        context.user_data.pop(key, None)
+
+
 def is_allowed(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id == WIFE_TG_ID)
 
 
+# =========================
+# Keyboards
+# =========================
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Внести транзакцию", callback_data="menu:add")],
@@ -353,11 +405,8 @@ def kb_edit_list(transactions: List[Dict]) -> InlineKeyboardMarkup:
     for tx in transactions:
         row_id = tx["row_id"]
         date_str = tx["date"][:10]
-        tx_type = tx["type"]
-        emoji = "➖" if tx_type == "расход" else "➕"
-        cat = tx["category"]
-        amt = tx["amount"]
-        label = f"{emoji} {date_str} | {cat} | {amt:,.0f} ₽".replace(",", " ")
+        emoji = "➖" if tx["type"] == "расход" else "➕"
+        label = f"{emoji} {date_str} | {tx['category']} | {tx['amount']:,.0f} ₽".replace(",", " ")
         rows.append([InlineKeyboardButton(label, callback_data=f"edit_row:{row_id}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")])
     return InlineKeyboardMarkup(rows)
@@ -378,35 +427,26 @@ def kb_edit_field() -> InlineKeyboardMarkup:
 def parse_amount(text: str) -> Optional[float]:
     if not text:
         return None
-    s0 = text.strip().lower()
-
+    s = re.sub(r"\s+", "", text.strip().lower())
     mult = 1.0
-    s = re.sub(r"\s+", "", s0)
     if s.endswith("к") or s.endswith("k"):
         mult = 1000.0
         s = s[:-1]
 
     has_comma = "," in s
     has_dot = "." in s
-
     if has_comma and has_dot:
-        last_comma = s.rfind(",")
-        last_dot = s.rfind(".")
-        dec_pos = max(last_comma, last_dot)
+        dec_pos = max(s.rfind(","), s.rfind("."))
         int_part = re.sub(r"[.,]", "", s[:dec_pos])
         frac_part = re.sub(r"[.,]", "", s[dec_pos + 1:])
         s = f"{int_part}.{frac_part}"
-    elif has_comma and not has_dot:
+    elif has_comma:
         s = s.replace(",", ".")
-    else:
-        pass
 
     s = re.sub(r"[^0-9.\-]", "", s)
     try:
         val = float(s) * mult
-        if val < 0:
-            return None
-        return round(val, 2)
+        return round(val, 2) if val > 0 else None
     except Exception:
         return None
 
@@ -417,38 +457,38 @@ def parse_amount(text: str) -> Optional[float]:
 async def gas_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(payload)
     payload["user_id"] = WIFE_TG_ID
-
-    timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(SCRIPT_URL, json=payload) as resp:
-            txt = await resp.text()
-            try:
-                data = await resp.json()
-            except Exception:
-                logger.error("GAS non-json response: %s", txt)
-                raise RuntimeError("GAS вернул не-JSON ответ")
-            if not data.get("ok"):
-                raise RuntimeError(data.get("error") or "GAS error")
-            return data["data"]
+    session = await get_http_session()
+    async with session.post(SCRIPT_URL, json=payload) as resp:
+        txt = await resp.text()
+        try:
+            data = await resp.json(content_type=None)
+        except Exception:
+            logger.error("GAS non-json response: %s", txt)
+            raise RuntimeError("GAS вернул не-JSON ответ")
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error") or "GAS error")
+        return data["data"]
 
 
 async def month_screen_text() -> str:
-    s = await gas_request({"cmd": "summary_month"})
-    month = s.get("month_label", "Текущий месяц")
-    exp = s.get("expenses", 0)
-    inc = s.get("incomes", 0)
-    bal = s.get("balance", 0)
-    init_bal = s.get("initial_balance", 0)
-    curr_bal = s.get("current_balance", 0)
-
+    s = await _fetch_month_summary()
     return (
-        f"<b>{month}</b>\n"
-        f"💰 Начальный баланс: <b>{init_bal:,.2f}</b> ₽\n"
-        f"➖ Расходы: <b>{exp:,.2f}</b> ₽\n"
-        f"➕ Доходы: <b>{inc:,.2f}</b> ₽\n"
-        f"📊 Баланс месяца: <b>{bal:,.2f}</b> ₽\n"
-        f"💳 Текущий баланс: <b>{curr_bal:,.2f}</b> ₽"
+        f"<b>{s.get('month_label', 'Текущий месяц')}</b>\n"
+        f"💰 Начальный баланс: <b>{s.get('initial_balance', 0):,.2f}</b> ₽\n"
+        f"➖ Расходы: <b>{s.get('expenses', 0):,.2f}</b> ₽\n"
+        f"➕ Доходы: <b>{s.get('incomes', 0):,.2f}</b> ₽\n"
+        f"📊 Баланс месяца: <b>{s.get('balance', 0):,.2f}</b> ₽\n"
+        f"💳 Текущий баланс: <b>{s.get('current_balance', 0):,.2f}</b> ₽"
     ).replace(",", " ")
+
+
+async def safe_month_text() -> Optional[str]:
+    """Возвращает текст экрана месяца или None при ошибке."""
+    try:
+        return await month_screen_text()
+    except Exception:
+        logger.warning("Could not fetch month summary")
+        return None
 
 
 # =========================
@@ -459,53 +499,46 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
 
-    txt = await month_screen_text()
-    await update.message.reply_text(
-        f"Привет, Иришка! 🙂\n\n{txt}",
-        reply_markup=kb_main(),
-        parse_mode=ParseMode.HTML
-    )
+    month_txt = await safe_month_text()
+    body = f"Привет, Иришка! 🙂\n\n{month_txt}" if month_txt else f"Привет, Иришка! 🙂\n\n{GAS_ERROR_TEXT}"
+    await update.message.reply_text(body, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
     return ST_MENU
 
 
 async def handle_text_in_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Любое текстовое сообщение в меню — напоминаем про кнопки"""
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return ConversationHandler.END
 
-    txt = await month_screen_text()
-    await update.message.reply_text(
-        f"Используй кнопки ниже 🙂\n\n{txt}",
-        reply_markup=kb_main(),
-        parse_mode=ParseMode.HTML
-    )
+    month_txt = await safe_month_text()
+    body = f"Используй кнопки ниже 🙂\n\n{month_txt}" if month_txt else "Используй кнопки ниже 🙂"
+    await update.message.reply_text(body, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
     return ST_MENU
 
 
 async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     action = q.data.split(":")[1]
 
     if action == "add":
-        await q.edit_message_text(
-            "Что вносим?",
-            reply_markup=kb_choose_type()
-        )
+        await q.edit_message_text("Что вносим?", reply_markup=kb_choose_type())
         return ST_ADD_CHOOSE_TYPE
 
     elif action == "edit":
-        result = await gas_request({"cmd": "get_recent_transactions", "limit": 10})
-        transactions = result.get("transactions", [])
+        try:
+            result = await gas_request({"cmd": "get_recent_transactions", "limit": 10})
+        except Exception:
+            logger.exception("on_menu edit: GAS error")
+            await q.edit_message_text(GAS_ERROR_TEXT, reply_markup=kb_main())
+            return ST_MENU
 
+        transactions = result.get("transactions", [])
         if not transactions:
             await q.answer("Записей пока нет", show_alert=True)
             return ST_MENU
 
         context.user_data["edit_transactions"] = transactions
-
         await q.edit_message_text(
             "<b>Последние записи:</b>\n\nВыбери что исправить:",
             reply_markup=kb_edit_list(transactions),
@@ -514,17 +547,11 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_EDIT_SELECT
 
     elif action == "analysis":
-        await q.edit_message_text(
-            "Что анализируем?",
-            reply_markup=kb_analysis_kind()
-        )
+        await q.edit_message_text("Что анализируем?", reply_markup=kb_analysis_kind())
         return ST_ANALYSIS_KIND
 
     elif action == "set_balance":
-        msg = await q.edit_message_text(
-            "Окей, напиши текущий баланс (число):"
-        )
-        context.user_data["working_message_id"] = msg.message_id
+        await q.edit_message_text("Окей, напиши текущий баланс (число):")
         return ST_SET_BALANCE
 
     return ST_MENU
@@ -533,80 +560,54 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     tx_type = q.data.split(":")[1]
     context.user_data["tx"] = {"type": "расход" if tx_type == "expense" else "доход"}
 
     if tx_type == "expense":
-        msg = await q.edit_message_text(
-            random.choice(PH_EXP_CAT),
-            reply_markup=kb_expense_categories()
-        )
-        context.user_data["working_message_id"] = msg.message_id
+        await q.edit_message_text(random.choice(PH_EXP_CAT), reply_markup=kb_expense_categories())
         return ST_EXP_CATEGORY
     else:
-        msg = await q.edit_message_text(
-            random.choice(PH_INC_CAT),
-            reply_markup=kb_income_categories()
-        )
-        context.user_data["working_message_id"] = msg.message_id
+        await q.edit_message_text(random.choice(PH_INC_CAT), reply_markup=kb_income_categories())
         return ST_INC_CATEGORY
 
 
 async def expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     idx = int(q.data.split(":")[1])
-    cats = list(EXPENSES.keys())
-    cat = cats[idx]
+    cat = list(EXPENSES.keys())[idx]
 
     tx = context.user_data.get("tx", {})
     tx["category"] = cat
     context.user_data["tx"] = tx
 
     phrase = random.choice(PH_EXP_SUB).replace("{cat}", cat)
-    msg = await q.edit_message_text(
-        phrase,
-        reply_markup=kb_expense_subcategories(cat),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    context.user_data["working_message_id"] = msg.message_id
+    await q.edit_message_text(phrase, reply_markup=kb_expense_subcategories(cat), parse_mode=ParseMode.HTML)
     return ST_EXP_SUBCATEGORY
 
 
 async def expense_subcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     idx = int(q.data.split(":")[1])
     tx = context.user_data.get("tx", {})
-    cat = tx.get("category")
-    subs = EXPENSES.get(cat, [])
-    sub = subs[idx]
-
-    tx["subcategory"] = sub
+    tx["subcategory"] = EXPENSES.get(tx.get("category"), [])[idx]
     context.user_data["tx"] = tx
 
-    msg = await q.edit_message_text(random.choice(PH_AMOUNT_EXP))
-    context.user_data["working_message_id"] = msg.message_id
+    await q.edit_message_text(random.choice(PH_AMOUNT_EXP))
     return ST_AMOUNT
 
 
 async def income_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     idx = int(q.data.split(":")[1])
-    cat = INCOME_CATEGORIES[idx]
-
     tx = context.user_data.get("tx", {})
-    tx["category"] = cat
+    tx["category"] = INCOME_CATEGORIES[idx]
     tx["subcategory"] = ""
     context.user_data["tx"] = tx
 
-    msg = await q.edit_message_text(random.choice(PH_AMOUNT_INC))
-    context.user_data["working_message_id"] = msg.message_id
+    await q.edit_message_text(random.choice(PH_AMOUNT_INC))
     return ST_AMOUNT
 
 
@@ -621,42 +622,28 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     amt = parse_amount(update.message.text)
-    if amt is None or amt <= 0:
-        await delete_working_message(context, update.effective_chat.id)
-        msg = await update.effective_chat.send_message(
+    if amt is None:
+        await update.effective_chat.send_message(
             "Не понял сумму 🙈\nНапиши, пожалуйста, например: 2500 / 2 500 / 2к"
         )
-        context.user_data["working_message_id"] = msg.message_id
         return ST_AMOUNT
 
     tx = context.user_data.get("tx", {})
     tx["amount"] = amt
     context.user_data["tx"] = tx
 
-    await delete_working_message(context, update.effective_chat.id)
-
-    if tx.get("type") == "расход":
-        phrase = random.choice(PH_COMMENT_EXP)
-    else:
-        phrase = random.choice(PH_COMMENT_INC)
-
-    msg = await update.effective_chat.send_message(
-        phrase,
-        reply_markup=kb_skip_comment()
-    )
-    context.user_data["working_message_id"] = msg.message_id
+    phrase = random.choice(PH_COMMENT_EXP if tx.get("type") == "расход" else PH_COMMENT_INC)
+    await update.effective_chat.send_message(phrase, reply_markup=kb_skip_comment())
     return ST_COMMENT
 
 
 async def comment_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     tx = context.user_data.get("tx", {})
     tx["comment"] = ""
     context.user_data["tx"] = tx
-
-    await save_and_finish_(update, context)
+    await save_and_finish(update, context, via_callback=True)
     return ST_MENU
 
 
@@ -673,58 +660,66 @@ async def comment_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx = context.user_data.get("tx", {})
     tx["comment"] = (update.message.text or "").strip()
     context.user_data["tx"] = tx
-
-    await save_and_finish_(update, context)
+    await save_and_finish(update, context, via_callback=False)
     return ST_MENU
 
 
-async def save_and_finish_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await delete_working_message(context, update.effective_chat.id)
-
+async def save_and_finish(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    via_callback: bool = False,
+) -> None:
+    """Сохраняет транзакцию, всегда шлёт новое сообщение с итогом."""
     tx = context.user_data.get("tx", {})
-    payload = {
-        "cmd": "add",
-        "type": tx.get("type"),
-        "category": tx.get("category"),
-        "subcategory": tx.get("subcategory", ""),
-        "amount": tx.get("amount"),
-        "comment": tx.get("comment", ""),
-    }
+    _invalidate_month_cache()
 
-    await gas_request(payload)
+    # Убираем кнопку "Пропустить" со старого сообщения
+    if via_callback:
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    try:
+        await gas_request({
+            "cmd": "add",
+            "type": tx.get("type"),
+            "category": tx.get("category"),
+            "subcategory": tx.get("subcategory", ""),
+            "amount": tx.get("amount"),
+            "comment": tx.get("comment", ""),
+        })
+    except Exception:
+        logger.exception("save_and_finish: GAS error")
+        reset_dialog(context)
+        await update.effective_chat.send_message(
+            f"{GAS_ERROR_TEXT}\nДанные не сохранились, попробуй ещё раз.",
+            reply_markup=kb_main()
+        )
+        return
 
     if tx.get("type") == "расход":
         header = random.choice(PH_SAVED_EXP)
-        detail = f"{tx.get('category')} → {tx.get('subcategory')} — {tx.get('amount'):,.2f} ₽".replace(",", " ")
+        detail = f"<i>{tx.get('category')} → {tx.get('subcategory')}</i> — <b>{tx.get('amount'):,.2f} ₽</b>".replace(",", " ")
     else:
         header = random.choice(PH_SAVED_INC)
-        detail = f"{tx.get('category')} — {tx.get('amount'):,.2f} ₽".replace(",", " ")
+        detail = f"<i>{tx.get('category')}</i> — <b>{tx.get('amount'):,.2f} ₽</b>".replace(",", " ")
 
-    comment = tx.get("comment", "").strip()
-    if comment:
-        detail += f"\nКоммент: {comment}"
+    if tx.get("comment", "").strip():
+        detail += f"\n💬 {tx['comment'].strip()}"
 
-    await update.effective_chat.send_message(f"{header}\n{detail}")
+    month_txt = await safe_month_text()
+    text = f"{header}\n{detail}\n\n{month_txt}" if month_txt else f"{header}\n{detail}"
 
-    txt_month = await month_screen_text()
-    await update.effective_chat.send_message(
-        txt_month,
-        reply_markup=kb_main(),
-        parse_mode=ParseMode.HTML
-    )
+    # Всегда новое сообщение — видно внизу чата, не теряется
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
 
 
 async def analysis_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
-    kind = q.data.split(":")[1]
-    context.user_data["analysis_kind"] = kind
-
-    await q.edit_message_text(
-        "За какой период?",
-        reply_markup=kb_analysis_period()
-    )
+    context.user_data["analysis_kind"] = q.data.split(":")[1]
+    await q.edit_message_text("За какой период?", reply_markup=kb_analysis_period())
     return ST_ANALYSIS_PERIOD
 
 
@@ -733,21 +728,14 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     period = q.data.split(":")[1]
-    kind = context.user_data.get("analysis_kind", "expense")
+    kind_rus = "расход" if context.user_data.get("analysis_kind") == "expense" else "доход"
 
-    kind_map = {
-        "expense": "расход",
-        "income": "доход"
-    }
-    kind_rus = kind_map.get(kind, "расход")
-
-    await delete_working_message(context, update.effective_chat.id)
-
-    result = await gas_request({
-        "cmd": "analysis",
-        "kind": kind_rus,
-        "period": period
-    })
+    try:
+        result = await gas_request({"cmd": "analysis", "kind": kind_rus, "period": period})
+    except Exception:
+        logger.exception("analysis_period: GAS error")
+        await q.edit_message_text(GAS_ERROR_TEXT, reply_markup=kb_main())
+        return ST_MENU
 
     title = result.get("title", "Анализ")
     items = result.get("items", [])
@@ -757,18 +745,13 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = f"<b>{title}</b>\n\n"
         for it in items:
-            cat = it.get("category", "?")
-            amt = it.get("amount", 0)
-            text += f"• {cat}: <b>{amt:,.2f}</b> ₽\n".replace(",", " ")
+            text += f"• {it.get('category', '?')}: <b>{it.get('amount', 0):,.2f}</b> ₽\n".replace(",", " ")
 
-    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
+    month_txt = await safe_month_text()
+    if month_txt:
+        text += f"\n\n{month_txt}"
 
-    txt_month = await month_screen_text()
-    await update.effective_chat.send_message(
-        txt_month,
-        reply_markup=kb_main(),
-        parse_mode=ParseMode.HTML
-    )
+    await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
     return ST_MENU
 
 
@@ -784,70 +767,50 @@ async def set_balance_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
     bal = parse_amount(update.message.text)
     if bal is None:
-        await delete_working_message(context, update.effective_chat.id)
-        msg = await update.effective_chat.send_message(
+        await update.effective_chat.send_message(
             "Не понял число 🙈 Напиши ещё раз, например: 25000 / 25 000 / 25к"
         )
-        context.user_data["working_message_id"] = msg.message_id
         return ST_SET_BALANCE
 
-    await gas_request({"cmd": "set_balance", "balance": bal})
+    _invalidate_month_cache()
 
-    await delete_working_message(context, update.effective_chat.id)
-    await update.effective_chat.send_message(
-        f"✅ Баланс установлен: <b>{bal:,.2f}</b> ₽".replace(",", " "),
-        parse_mode=ParseMode.HTML
-    )
+    try:
+        await gas_request({"cmd": "set_balance", "balance": bal})
+    except Exception:
+        logger.exception("set_balance_received: GAS error")
+        reset_dialog(context)
+        await update.effective_chat.send_message(GAS_ERROR_TEXT, reply_markup=kb_main())
+        return ST_MENU
 
-    txt_month = await month_screen_text()
-    await update.effective_chat.send_message(
-        txt_month,
-        reply_markup=kb_main(),
-        parse_mode=ParseMode.HTML
-    )
+    month_txt = await safe_month_text()
+    conf = f"✅ Баланс установлен: <b>{bal:,.2f} ₽</b>".replace(",", " ")
+    text = f"{conf}\n\n{month_txt}" if month_txt else conf
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
     return ST_MENU
 
 
 async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     dest = q.data.split(":")[1]
 
     if dest == "menu":
-        await delete_working_message(context, update.effective_chat.id)
-        txt = await month_screen_text()
-        await update.effective_chat.send_message(
-            txt,
-            reply_markup=kb_main(),
-            parse_mode=ParseMode.HTML
-        )
+        month_txt = await safe_month_text()
+        text = month_txt or "Главное меню"
+        await q.edit_message_text(text, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
         return ST_MENU
-
     elif dest == "choose_type":
-        await q.edit_message_text(
-            "Что вносим?",
-            reply_markup=kb_choose_type()
-        )
+        await q.edit_message_text("Что вносим?", reply_markup=kb_choose_type())
         return ST_ADD_CHOOSE_TYPE
-
     elif dest == "exp_cat":
         tx = context.user_data.get("tx", {})
         tx.pop("subcategory", None)
         context.user_data["tx"] = tx
-        await q.edit_message_text(
-            random.choice(PH_EXP_CAT),
-            reply_markup=kb_expense_categories()
-        )
+        await q.edit_message_text(random.choice(PH_EXP_CAT), reply_markup=kb_expense_categories())
         return ST_EXP_CATEGORY
-
     elif dest == "analysis_kind":
-        await q.edit_message_text(
-            "Что анализируем?",
-            reply_markup=kb_analysis_kind()
-        )
+        await q.edit_message_text("Что анализируем?", reply_markup=kb_analysis_kind())
         return ST_ANALYSIS_KIND
-
     elif dest == "edit_list":
         transactions = context.user_data.get("edit_transactions", [])
         await q.edit_message_text(
@@ -865,13 +828,8 @@ async def edit_select_row(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     row_id = int(q.data.split(":")[1])
-
     transactions = context.user_data.get("edit_transactions", [])
-    selected_tx = None
-    for tx in transactions:
-        if tx["row_id"] == row_id:
-            selected_tx = tx
-            break
+    selected_tx = next((t for t in transactions if t["row_id"] == row_id), None)
 
     if not selected_tx:
         await q.answer("Ошибка: запись не найдена", show_alert=True)
@@ -879,25 +837,17 @@ async def edit_select_row(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["selected_transaction"] = selected_tx
 
-    tx_type = selected_tx["type"]
-    emoji = "➖" if tx_type == "расход" else "➕"
-    date_str = selected_tx["date"][:16]
-    cat = selected_tx["category"]
-    subcat = selected_tx.get("subcategory", "")
-    amt = selected_tx["amount"]
-    comment = selected_tx.get("comment", "")
-
+    emoji = "➖" if selected_tx["type"] == "расход" else "➕"
     text = (
-        f"<b>{emoji} {tx_type.capitalize()}</b>\n"
-        f"📅 {date_str}\n"
-        f"📂 {cat}"
+        f"<b>{emoji} {selected_tx['type'].capitalize()}</b>\n"
+        f"📅 {selected_tx['date'][:16]}\n"
+        f"📂 {selected_tx['category']}"
     )
-    if subcat:
-        text += f" → {subcat}"
-    text += f"\n💰 {amt:,.2f} ₽".replace(",", " ")
-    if comment:
-        text += f"\n💬 {comment}"
-
+    if selected_tx.get("subcategory"):
+        text += f" → {selected_tx['subcategory']}"
+    text += f"\n💰 {selected_tx['amount']:,.2f} ₽".replace(",", " ")
+    if selected_tx.get("comment"):
+        text += f"\n💬 {selected_tx['comment']}"
     text += "\n\n<b>Что хочешь изменить?</b>"
 
     await q.edit_message_text(text, reply_markup=kb_edit_field(), parse_mode=ParseMode.HTML)
@@ -910,40 +860,38 @@ async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     field = q.data.split(":")[1]
     context.user_data["edit_field"] = field
-
     selected_tx = context.user_data.get("selected_transaction", {})
 
     if field == "delete":
-        row_id = selected_tx["row_id"]
-        await gas_request({"cmd": "delete_transaction", "row_id": row_id})
+        _invalidate_month_cache()
+        try:
+            await gas_request({"cmd": "delete_transaction", "row_id": selected_tx["row_id"]})
+        except Exception:
+            logger.exception("edit_field_selected delete: GAS error")
+            reset_dialog(context)
+            await q.edit_message_text(GAS_ERROR_TEXT, reply_markup=kb_main())
+            return ST_MENU
 
-        await delete_working_message(context, update.effective_chat.id)
-        await update.effective_chat.send_message("✅ Запись удалена")
-
-        txt = await month_screen_text()
-        await update.effective_chat.send_message(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
+        month_txt = await safe_month_text()
+        text = f"✅ Запись удалена\n\n{month_txt}" if month_txt else "✅ Запись удалена"
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
         return ST_MENU
 
     elif field == "amount":
         current_amt = selected_tx.get("amount", 0)
         await q.edit_message_text(
-            f"Текущая сумма: <b>{current_amt:,.2f}</b> ₽\n\n"
-            f"Введи новую сумму:\n"
-            f"(например: 2500 / 2 500 / 2к)".replace(",", " "),
+            f"Текущая сумма: <b>{current_amt:,.2f} ₽</b>\n\nВведи новую сумму:\n(например: 2500 / 2 500 / 2к)".replace(",", " "),
             parse_mode=ParseMode.HTML
         )
         return ST_EDIT_VALUE
 
     elif field == "comment":
-        current_comment = selected_tx.get("comment", "")
-        text = "Текущий комментарий: "
-        if current_comment:
-            text += f"<i>{current_comment}</i>"
-        else:
-            text += "<i>(пусто)</i>"
-        text += "\n\nВведи новый комментарий:"
-
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML)
+        current = selected_tx.get("comment", "")
+        note = f"<i>{current}</i>" if current else "<i>(пусто)</i>"
+        await q.edit_message_text(
+            f"Текущий комментарий: {note}\n\nВведи новый комментарий:",
+            parse_mode=ParseMode.HTML
+        )
         return ST_EDIT_VALUE
 
     return ST_EDIT_FIELD
@@ -965,32 +913,37 @@ async def edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if field == "amount":
         amt = parse_amount(update.message.text)
-        if amt is None or amt <= 0:
-            await delete_working_message(context, update.effective_chat.id)
-            msg = await update.effective_chat.send_message(
+        if amt is None:
+            await update.effective_chat.send_message(
                 "Не понял сумму 🙈\nНапиши, пожалуйста, например: 2500 / 2 500 / 2к"
             )
-            context.user_data["working_message_id"] = msg.message_id
             return ST_EDIT_VALUE
-
-        await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "amount", "value": amt})
-
-        await delete_working_message(context, update.effective_chat.id)
-        await update.effective_chat.send_message(
-            f"✅ Сумма изменена на <b>{amt:,.2f}</b> ₽".replace(",", " "),
-            parse_mode=ParseMode.HTML
-        )
+        _invalidate_month_cache()
+        try:
+            await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "amount", "value": amt})
+        except Exception:
+            logger.exception("edit_value_received amount: GAS error")
+            reset_dialog(context)
+            await update.effective_chat.send_message(GAS_ERROR_TEXT, reply_markup=kb_main())
+            return ST_MENU
+        conf = f"✅ Сумма изменена на <b>{amt:,.2f} ₽</b>".replace(",", " ")
 
     elif field == "comment":
         comment = (update.message.text or "").strip()
-        await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "comment", "value": comment})
+        try:
+            await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "comment", "value": comment})
+        except Exception:
+            logger.exception("edit_value_received comment: GAS error")
+            reset_dialog(context)
+            await update.effective_chat.send_message(GAS_ERROR_TEXT, reply_markup=kb_main())
+            return ST_MENU
+        conf = "✅ Комментарий изменён"
+    else:
+        conf = "✅ Готово"
 
-        await delete_working_message(context, update.effective_chat.id)
-        await update.effective_chat.send_message("✅ Комментарий изменен")
-
-    txt = await month_screen_text()
-    await update.effective_chat.send_message(txt, reply_markup=kb_main(), parse_mode=ParseMode.HTML)
-
+    month_txt = await safe_month_text()
+    text = f"{conf}\n\n{month_txt}" if month_txt else conf
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
     return ST_MENU
 
 
@@ -1013,12 +966,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error: %s", context.error)
     try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("Ой, что-то пошло не так 🙈 Попробуем ещё раз?")
+        if isinstance(update, Update):
+            reset_dialog(context)
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    "Ой, что-то пошло не так 🙈\nПопробуй начать заново — нажми /start",
+                    reply_markup=kb_main()
+                )
     except Exception:
         pass
 
 
+# =========================
+# App + graceful shutdown
+# =========================
 def build_app() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1079,6 +1040,7 @@ def build_app() -> Application:
             ],
         },
         fallbacks=[CommandHandler("help", cmd_help)],
+        per_message=False,
         allow_reentry=True,
     )
 
@@ -1091,12 +1053,29 @@ def build_app() -> Application:
 def run():
     app = build_app()
 
+    # Graceful shutdown: ловим SIGTERM (Railway) и SIGINT (Ctrl+C)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _shutdown(sig_name: str):
+        logger.info("Received %s, shutting down gracefully...", sig_name)
+        await app.stop()
+        await app.shutdown()
+        await close_http_session()
+        loop.stop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(
+                sig, lambda s=sig: asyncio.ensure_future(_shutdown(s.name))
+            )
+        except NotImplementedError:
+            pass  # Windows не поддерживает add_signal_handler
+
     if WEBHOOK_URL:
         url_path = WEBHOOK_PATH or _default_webhook_path()
         full_webhook = f"{WEBHOOK_URL.rstrip('/')}/{url_path}"
-
         logger.info("Starting webhook on 0.0.0.0:%s", PORT)
-
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
