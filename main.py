@@ -313,6 +313,15 @@ def is_allowed(update: Update) -> bool:
     return bool(user and user.id == WIFE_TG_ID)
 
 
+async def typing(update: Update) -> None:
+    """Показывает индикатор 'печатает...' пока идёт запрос к GAS."""
+    try:
+        from telegram.constants import ChatAction
+        await update.effective_chat.send_chat_action(ChatAction.TYPING)
+    except Exception:
+        pass
+
+
 # =========================
 # Keyboards
 # =========================
@@ -457,17 +466,28 @@ def parse_amount(text: str) -> Optional[float]:
 async def gas_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(payload)
     payload["user_id"] = WIFE_TG_ID
+    cmd = payload.get("cmd", "?")
+    logger.info("GAS >> cmd=%s payload=%s", cmd, {k: v for k, v in payload.items() if k != "user_id"})
     session = await get_http_session()
-    async with session.post(SCRIPT_URL, json=payload) as resp:
-        txt = await resp.text()
-        try:
-            data = await resp.json(content_type=None)
-        except Exception:
-            logger.error("GAS non-json response: %s", txt)
-            raise RuntimeError("GAS вернул не-JSON ответ")
-        if not data.get("ok"):
-            raise RuntimeError(data.get("error") or "GAS error")
-        return data["data"]
+    try:
+        async with session.post(SCRIPT_URL, json=payload) as resp:
+            txt = await resp.text()
+            logger.info("GAS << cmd=%s status=%s body=%.300s", cmd, resp.status, txt)
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                logger.error("GAS non-json response cmd=%s: %s", cmd, txt)
+                raise RuntimeError("GAS вернул не-JSON ответ")
+            if not data.get("ok"):
+                err = data.get("error") or "GAS error"
+                logger.error("GAS error cmd=%s: %s", cmd, err)
+                raise RuntimeError(err)
+            return data["data"]
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.error("GAS request failed cmd=%s: %s", cmd, e)
+        raise
 
 
 async def month_screen_text() -> str:
@@ -526,6 +546,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_ADD_CHOOSE_TYPE
 
     elif action == "edit":
+        await typing(update)
         try:
             result = await gas_request({"cmd": "get_recent_transactions", "limit": 10})
         except Exception:
@@ -680,6 +701,7 @@ async def save_and_finish(
         except Exception:
             pass
 
+    await typing(update)
     try:
         await gas_request({
             "cmd": "add",
@@ -730,6 +752,7 @@ async def analysis_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     period = q.data.split(":")[1]
     kind_rus = "расход" if context.user_data.get("analysis_kind") == "expense" else "доход"
 
+    await typing(update)
     try:
         result = await gas_request({"cmd": "analysis", "kind": kind_rus, "period": period})
     except Exception:
@@ -774,6 +797,7 @@ async def set_balance_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
     _invalidate_month_cache()
 
+    await typing(update)
     try:
         await gas_request({"cmd": "set_balance", "balance": bal})
     except Exception:
@@ -864,6 +888,7 @@ async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if field == "delete":
         _invalidate_month_cache()
+        await typing(update)
         try:
             await gas_request({"cmd": "delete_transaction", "row_id": selected_tx["row_id"]})
         except Exception:
@@ -919,6 +944,7 @@ async def edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return ST_EDIT_VALUE
         _invalidate_month_cache()
+        await typing(update)
         try:
             await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "amount", "value": amt})
         except Exception:
@@ -930,6 +956,7 @@ async def edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif field == "comment":
         comment = (update.message.text or "").strip()
+        await typing(update)
         try:
             await gas_request({"cmd": "update_transaction", "row_id": row_id, "field": "comment", "value": comment})
         except Exception:
